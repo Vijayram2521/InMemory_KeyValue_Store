@@ -1,16 +1,16 @@
 cmake_minimum_required(VERSION 3.15)
-project(LSM_KV_Store VERSION 1.0 LANGUAGES CXX)
+project(LSM_KV_Store)
 
-# Use C++17 for shared_mutex and modern filesystem support
+# Set C++17 for std::optional and shared_mutex
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Tell CMake where to find your .h files
 include_directories(include)
 
-# Define our library (the engine)
-file(GLOB_RECURSE SOURCES "src/*.cpp")
-add_library(kv_engine ${SOURCES})
+# Create the library from your implementation
+add_library(kv_engine src/storage_engine.cpp)
 
-# Define the main executable
+# Create the executable and link it to the library
 add_executable(lsm_cli src/main.cpp)
 target_link_libraries(lsm_cli kv_engine)

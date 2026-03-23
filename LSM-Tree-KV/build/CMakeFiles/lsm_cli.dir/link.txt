@@ -1,0 +1,3 @@
+C:\msys64\ucrt64\bin\cmake.exe -E rm -f CMakeFiles\lsm_cli.dir/objects.a
+C:\msys64\ucrt64\bin\ar.exe qc CMakeFiles\lsm_cli.dir/objects.a @CMakeFiles\lsm_cli.dir\objects1.rsp
+C:\msys64\ucrt64\bin\c++.exe -Wl,--whole-archive CMakeFiles\lsm_cli.dir/objects.a -Wl,--no-whole-archive -o lsm_cli.exe -Wl,--out-implib,liblsm_cli.dll.a -Wl,--major-image-version,0,--minor-image-version,0 @CMakeFiles\lsm_cli.dir\linkLibs.rsp

@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"D:/MemCache/InMemory_KeyValue_Store/LSM-Tree-KV/build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
