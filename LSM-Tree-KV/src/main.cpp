@@ -1,53 +1,52 @@
+#include "engine/storage_engine.h"
 #include <iostream>
-#include <string>
-#include "../include/engine/storage_engine.h"
+#include <cassert>
 
-/**
- * Basic CLI / Driver for the LSM-Tree Key-Value Store.
- * This file verifies our In-Memory implementation before we 
- * move on to the Write-Ahead Log (WAL).
- */
+using namespace kv_engine;
+
+void run_persistence_test() {
+    const std::string wal_path = "wal.log";
+
+    // --- SESSION 1: Create and Write ---
+    std::cout << "\n--- Session 1: Writing Data ---" << std::endl;
+    {
+        StorageEngine engine(wal_path);
+        engine.Put("user_1", "Alice");
+        engine.Put("user_2", "Bob");
+        engine.Put("status", "Active");
+        
+        std::cout << "Data committed to WAL. Destroying engine now..." << std::endl;
+        // Engine goes out of scope here and is DESTROYED
+    }
+
+    std::cout << "Engine is now DEAD. Memory is cleared." << std::endl;
+
+    // --- SESSION 2: Recreate and Verify ---
+    std::cout << "\n--- Session 2: Recovering Data ---" << std::endl;
+    {
+        StorageEngine engine(wal_path);
+        
+        // Check if the data "survived" the destruction of the first engine
+        auto val1 = engine.Get("user_1");
+        auto val2 = engine.Get("user_2");
+        auto val3 = engine.Get("status");
+
+        if (val1 && *val1 == "Alice" && val2 && *val2 == "Bob") {
+            std::cout << "✅ SUCCESS: Data recovered from WAL!" << std::endl;
+            std::cout << "user_1: " << *val1 << std::endl;
+            std::cout << "user_2: " << *val2 << std::endl;
+        } else {
+            std::cout << "❌ FAILURE: Data was lost!" << std::endl;
+        }
+    }
+}
+
 int main() {
-    // 1. Initialize the Engine
-    kv_engine::StorageEngine db;
-
-    std::cout << "--- Starting LSM-KV Store Test ---" << std::endl;
-
-    // 2. Test the "Put" (Write Path)
-    std::cout << "Inserting keys..." << std::endl;
-    db.Put("driver_id:101", "John_Doe");
-    db.Put("driver_id:102", "Jane_Smith");
-    db.Put("system_status", "ACTIVE");
-
-    // 3. Test the "Get" (Read Path)
-    std::cout << "Retrieving 'driver_id:101'..." << std::endl;
-    auto result = db.Get("driver_id:101");
-
-    if (result.has_value()) {
-        std::cout << "SUCCESS: Found Value -> " << result.value() << std::endl;
-    } else {
-        std::cout << "FAILURE: Key not found." << std::endl;
+    try {
+        run_persistence_test();
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return 1;
     }
-
-    // 4. Test "Delete" Logic
-    std::cout << "Deleting 'system_status'..." << std::endl;
-    if (db.Delete("system_status")) {
-        std::cout << "Key deleted successfully." << std::endl;
-    }
-
-    // Verify deletion
-    auto deleted_check = db.Get("system_status");
-    if (!deleted_check.has_value()) {
-        std::cout << "Verification: 'system_status' is no longer in memory." << std::endl;
-    }
-
-    // 5. Test Non-existent Key
-    auto missing = db.Get("unknown_key");
-    if (!missing.has_value()) {
-        std::cout << "Correctly handled missing key 'unknown_key'." << std::endl;
-    }
-
-    std::cout << "--- All basic tests passed! ---" << std::endl;
-
     return 0;
 }

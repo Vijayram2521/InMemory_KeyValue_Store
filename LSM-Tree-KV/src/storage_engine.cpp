@@ -16,7 +16,10 @@ struct StorageEngine::Impl {
     Impl(const std::string& path) : wal(path) {}
 };
 
-StorageEngine::StorageEngine(const std::string& wal_path) : pImpl(std::make_unique<Impl>(wal_path)) {}
+StorageEngine::StorageEngine(const std::string& wal_path) : pImpl(std::make_unique<Impl>(wal_path)) {
+    // On startup, recover the MemTable state from the WAL
+    pImpl->wal.recover(pImpl->data_map);
+}
 
 StorageEngine::~StorageEngine() = default;
 

@@ -1,5 +1,6 @@
-#include "engine/wal.h"
+#include "../include/engine/wal.h"
 #include <iostream>
+#include <map>
 
 WAL::WAL(const std::string& filepath) : path(filepath) {
     // Open in append and binary mode
@@ -36,5 +37,35 @@ bool WAL::append(LogOp op, const std::string& key, const std::string& value) {
         return true;
     } catch (...) {
         return false;
+    }
+}
+
+void WAL::recover(std::map<std::string, std::string>& memtable) {
+    std::ifstream reader(path, std::ios::binary | std::ios::in);
+    if (!reader.is_open()) return; // No log file yet, that's fine
+
+    while (reader.peek() != EOF) {
+        char type_raw;
+        uint32_t kLen, vLen;
+
+        // 1. Read Type
+        reader.read(&type_raw, sizeof(type_raw));
+        LogOp op = static_cast<LogOp>(type_raw);
+
+        // 2. Read Key
+        reader.read(reinterpret_cast<char*>(&kLen), sizeof(kLen));
+        std::string key(kLen, ' ');
+        reader.read(&key[0], kLen);
+
+        if (op == LogOp::PUT) {
+            // 3. Read Value
+            reader.read(reinterpret_cast<char*>(&vLen), sizeof(vLen));
+            std::string value(vLen, ' ');
+            reader.read(&value[0], vLen);
+            
+            memtable[key] = value; // Restore to memory
+        } else if (op == LogOp::DELETE) {
+            memtable.erase(key); // Replay the deletion
+        }
     }
 }

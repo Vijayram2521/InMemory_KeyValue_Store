@@ -4,6 +4,7 @@
 #include <string>
 #include <fstream>
 #include <mutex>
+#include <map>
 
 enum class LogOp : char {
     PUT = 1,
@@ -20,6 +21,9 @@ public:
 
     // Flushes buffers to physical disk
     void flush();
+
+    // Recovers the MemTable state from the log file
+    void recover(std::map<std::string, std::string>& memtable);
 
 private:
     std::ofstream log_file;
