@@ -189,6 +189,30 @@ src/storage_engine.cpp.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles\kv_engine.dir\build.make CMakeFiles/kv_engine.dir/src/storage_engine.cpp.s
 .PHONY : src/storage_engine.cpp.s
 
+src/wal.obj: src/wal.cpp.obj
+.PHONY : src/wal.obj
+
+# target to build an object file
+src/wal.cpp.obj:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\kv_engine.dir\build.make CMakeFiles/kv_engine.dir/src/wal.cpp.obj
+.PHONY : src/wal.cpp.obj
+
+src/wal.i: src/wal.cpp.i
+.PHONY : src/wal.i
+
+# target to preprocess a source file
+src/wal.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\kv_engine.dir\build.make CMakeFiles/kv_engine.dir/src/wal.cpp.i
+.PHONY : src/wal.cpp.i
+
+src/wal.s: src/wal.cpp.s
+.PHONY : src/wal.s
+
+# target to generate assembly for a file
+src/wal.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\kv_engine.dir\build.make CMakeFiles/kv_engine.dir/src/wal.cpp.s
+.PHONY : src/wal.cpp.s
+
 # Help Target
 help:
 	@echo The following are some of the valid targets for this Makefile:
@@ -205,6 +229,9 @@ help:
 	@echo ... src/storage_engine.obj
 	@echo ... src/storage_engine.i
 	@echo ... src/storage_engine.s
+	@echo ... src/wal.obj
+	@echo ... src/wal.i
+	@echo ... src/wal.s
 .PHONY : help
 
 

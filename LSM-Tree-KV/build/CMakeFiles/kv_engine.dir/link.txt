@@ -1,2 +1,2 @@
-C:\msys64\ucrt64\bin\ar.exe qc libkv_engine.a CMakeFiles/kv_engine.dir/src/storage_engine.cpp.obj
+C:\msys64\ucrt64\bin\ar.exe qc libkv_engine.a CMakeFiles/kv_engine.dir/src/storage_engine.cpp.obj CMakeFiles/kv_engine.dir/src/wal.cpp.obj
 C:\msys64\ucrt64\bin\ranlib.exe libkv_engine.a

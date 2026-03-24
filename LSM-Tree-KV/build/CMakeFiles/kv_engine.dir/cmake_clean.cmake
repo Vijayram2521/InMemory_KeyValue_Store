@@ -1,6 +1,8 @@
 file(REMOVE_RECURSE
   "CMakeFiles/kv_engine.dir/src/storage_engine.cpp.obj"
   "CMakeFiles/kv_engine.dir/src/storage_engine.cpp.obj.d"
+  "CMakeFiles/kv_engine.dir/src/wal.cpp.obj"
+  "CMakeFiles/kv_engine.dir/src/wal.cpp.obj.d"
   "libkv_engine.a"
   "libkv_engine.pdb"
 )
