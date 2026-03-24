@@ -9,7 +9,7 @@
 namespace kv_engine {
     class StorageEngine {
         public : 
-            StorageEngine(const std::string& wal_path = "wal.log"); ;
+            StorageEngine(const std::string& data_dir = "./data");
             ~StorageEngine() ;
 
             // Prevent copying to avoid multiple engines fighting over the same files

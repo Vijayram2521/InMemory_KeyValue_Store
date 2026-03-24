@@ -1,4 +1,8 @@
 file(REMOVE_RECURSE
+  "CMakeFiles/kv_engine.dir/src/manifest.cpp.obj"
+  "CMakeFiles/kv_engine.dir/src/manifest.cpp.obj.d"
+  "CMakeFiles/kv_engine.dir/src/sstable.cpp.obj"
+  "CMakeFiles/kv_engine.dir/src/sstable.cpp.obj.d"
   "CMakeFiles/kv_engine.dir/src/storage_engine.cpp.obj"
   "CMakeFiles/kv_engine.dir/src/storage_engine.cpp.obj.d"
   "CMakeFiles/kv_engine.dir/src/wal.cpp.obj"

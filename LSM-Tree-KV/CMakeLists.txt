@@ -9,7 +9,13 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 include_directories(include)
 
 # Create the library from your implementation
-add_library(kv_engine src/storage_engine.cpp src/wal.cpp)
+add_library(
+    kv_engine 
+    src/storage_engine.cpp 
+    src/wal.cpp 
+    src/manifest.cpp 
+    src/sstable.cpp
+)
 
 # Create the executable and link it to the library
 add_executable(lsm_cli src/main.cpp)

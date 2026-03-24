@@ -165,6 +165,54 @@ src/main.cpp.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles\lsm_cli.dir\build.make CMakeFiles/lsm_cli.dir/src/main.cpp.s
 .PHONY : src/main.cpp.s
 
+src/manifest.obj: src/manifest.cpp.obj
+.PHONY : src/manifest.obj
+
+# target to build an object file
+src/manifest.cpp.obj:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\kv_engine.dir\build.make CMakeFiles/kv_engine.dir/src/manifest.cpp.obj
+.PHONY : src/manifest.cpp.obj
+
+src/manifest.i: src/manifest.cpp.i
+.PHONY : src/manifest.i
+
+# target to preprocess a source file
+src/manifest.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\kv_engine.dir\build.make CMakeFiles/kv_engine.dir/src/manifest.cpp.i
+.PHONY : src/manifest.cpp.i
+
+src/manifest.s: src/manifest.cpp.s
+.PHONY : src/manifest.s
+
+# target to generate assembly for a file
+src/manifest.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\kv_engine.dir\build.make CMakeFiles/kv_engine.dir/src/manifest.cpp.s
+.PHONY : src/manifest.cpp.s
+
+src/sstable.obj: src/sstable.cpp.obj
+.PHONY : src/sstable.obj
+
+# target to build an object file
+src/sstable.cpp.obj:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\kv_engine.dir\build.make CMakeFiles/kv_engine.dir/src/sstable.cpp.obj
+.PHONY : src/sstable.cpp.obj
+
+src/sstable.i: src/sstable.cpp.i
+.PHONY : src/sstable.i
+
+# target to preprocess a source file
+src/sstable.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\kv_engine.dir\build.make CMakeFiles/kv_engine.dir/src/sstable.cpp.i
+.PHONY : src/sstable.cpp.i
+
+src/sstable.s: src/sstable.cpp.s
+.PHONY : src/sstable.s
+
+# target to generate assembly for a file
+src/sstable.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\kv_engine.dir\build.make CMakeFiles/kv_engine.dir/src/sstable.cpp.s
+.PHONY : src/sstable.cpp.s
+
 src/storage_engine.obj: src/storage_engine.cpp.obj
 .PHONY : src/storage_engine.obj
 
@@ -226,6 +274,12 @@ help:
 	@echo ... src/main.obj
 	@echo ... src/main.i
 	@echo ... src/main.s
+	@echo ... src/manifest.obj
+	@echo ... src/manifest.i
+	@echo ... src/manifest.s
+	@echo ... src/sstable.obj
+	@echo ... src/sstable.i
+	@echo ... src/sstable.s
 	@echo ... src/storage_engine.obj
 	@echo ... src/storage_engine.i
 	@echo ... src/storage_engine.s

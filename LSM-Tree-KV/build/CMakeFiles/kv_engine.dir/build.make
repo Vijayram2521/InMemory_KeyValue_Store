@@ -101,19 +101,53 @@ CMakeFiles/kv_engine.dir/src/wal.cpp.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling CXX source to assembly CMakeFiles/kv_engine.dir/src/wal.cpp.s"
 	C:\msys64\ucrt64\bin\c++.exe $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S D:\MemCache\InMemory_KeyValue_Store\LSM-Tree-KV\src\wal.cpp -o CMakeFiles\kv_engine.dir\src\wal.cpp.s
 
+CMakeFiles/kv_engine.dir/src/manifest.cpp.obj: CMakeFiles/kv_engine.dir/flags.make
+CMakeFiles/kv_engine.dir/src/manifest.cpp.obj: CMakeFiles/kv_engine.dir/includes_CXX.rsp
+CMakeFiles/kv_engine.dir/src/manifest.cpp.obj: D:/MemCache/InMemory_KeyValue_Store/LSM-Tree-KV/src/manifest.cpp
+CMakeFiles/kv_engine.dir/src/manifest.cpp.obj: CMakeFiles/kv_engine.dir/compiler_depend.ts
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=D:\MemCache\InMemory_KeyValue_Store\LSM-Tree-KV\build\CMakeFiles --progress-num=$(CMAKE_PROGRESS_3) "Building CXX object CMakeFiles/kv_engine.dir/src/manifest.cpp.obj"
+	C:\msys64\ucrt64\bin\c++.exe $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT CMakeFiles/kv_engine.dir/src/manifest.cpp.obj -MF CMakeFiles\kv_engine.dir\src\manifest.cpp.obj.d -o CMakeFiles\kv_engine.dir\src\manifest.cpp.obj -c D:\MemCache\InMemory_KeyValue_Store\LSM-Tree-KV\src\manifest.cpp
+
+CMakeFiles/kv_engine.dir/src/manifest.cpp.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing CXX source to CMakeFiles/kv_engine.dir/src/manifest.cpp.i"
+	C:\msys64\ucrt64\bin\c++.exe $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E D:\MemCache\InMemory_KeyValue_Store\LSM-Tree-KV\src\manifest.cpp > CMakeFiles\kv_engine.dir\src\manifest.cpp.i
+
+CMakeFiles/kv_engine.dir/src/manifest.cpp.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling CXX source to assembly CMakeFiles/kv_engine.dir/src/manifest.cpp.s"
+	C:\msys64\ucrt64\bin\c++.exe $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S D:\MemCache\InMemory_KeyValue_Store\LSM-Tree-KV\src\manifest.cpp -o CMakeFiles\kv_engine.dir\src\manifest.cpp.s
+
+CMakeFiles/kv_engine.dir/src/sstable.cpp.obj: CMakeFiles/kv_engine.dir/flags.make
+CMakeFiles/kv_engine.dir/src/sstable.cpp.obj: CMakeFiles/kv_engine.dir/includes_CXX.rsp
+CMakeFiles/kv_engine.dir/src/sstable.cpp.obj: D:/MemCache/InMemory_KeyValue_Store/LSM-Tree-KV/src/sstable.cpp
+CMakeFiles/kv_engine.dir/src/sstable.cpp.obj: CMakeFiles/kv_engine.dir/compiler_depend.ts
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=D:\MemCache\InMemory_KeyValue_Store\LSM-Tree-KV\build\CMakeFiles --progress-num=$(CMAKE_PROGRESS_4) "Building CXX object CMakeFiles/kv_engine.dir/src/sstable.cpp.obj"
+	C:\msys64\ucrt64\bin\c++.exe $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT CMakeFiles/kv_engine.dir/src/sstable.cpp.obj -MF CMakeFiles\kv_engine.dir\src\sstable.cpp.obj.d -o CMakeFiles\kv_engine.dir\src\sstable.cpp.obj -c D:\MemCache\InMemory_KeyValue_Store\LSM-Tree-KV\src\sstable.cpp
+
+CMakeFiles/kv_engine.dir/src/sstable.cpp.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing CXX source to CMakeFiles/kv_engine.dir/src/sstable.cpp.i"
+	C:\msys64\ucrt64\bin\c++.exe $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E D:\MemCache\InMemory_KeyValue_Store\LSM-Tree-KV\src\sstable.cpp > CMakeFiles\kv_engine.dir\src\sstable.cpp.i
+
+CMakeFiles/kv_engine.dir/src/sstable.cpp.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling CXX source to assembly CMakeFiles/kv_engine.dir/src/sstable.cpp.s"
+	C:\msys64\ucrt64\bin\c++.exe $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S D:\MemCache\InMemory_KeyValue_Store\LSM-Tree-KV\src\sstable.cpp -o CMakeFiles\kv_engine.dir\src\sstable.cpp.s
+
 # Object files for target kv_engine
 kv_engine_OBJECTS = \
 "CMakeFiles/kv_engine.dir/src/storage_engine.cpp.obj" \
-"CMakeFiles/kv_engine.dir/src/wal.cpp.obj"
+"CMakeFiles/kv_engine.dir/src/wal.cpp.obj" \
+"CMakeFiles/kv_engine.dir/src/manifest.cpp.obj" \
+"CMakeFiles/kv_engine.dir/src/sstable.cpp.obj"
 
 # External object files for target kv_engine
 kv_engine_EXTERNAL_OBJECTS =
 
 libkv_engine.a: CMakeFiles/kv_engine.dir/src/storage_engine.cpp.obj
 libkv_engine.a: CMakeFiles/kv_engine.dir/src/wal.cpp.obj
+libkv_engine.a: CMakeFiles/kv_engine.dir/src/manifest.cpp.obj
+libkv_engine.a: CMakeFiles/kv_engine.dir/src/sstable.cpp.obj
 libkv_engine.a: CMakeFiles/kv_engine.dir/build.make
 libkv_engine.a: CMakeFiles/kv_engine.dir/link.txt
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --bold --progress-dir=D:\MemCache\InMemory_KeyValue_Store\LSM-Tree-KV\build\CMakeFiles --progress-num=$(CMAKE_PROGRESS_3) "Linking CXX static library libkv_engine.a"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --bold --progress-dir=D:\MemCache\InMemory_KeyValue_Store\LSM-Tree-KV\build\CMakeFiles --progress-num=$(CMAKE_PROGRESS_5) "Linking CXX static library libkv_engine.a"
 	$(CMAKE_COMMAND) -P CMakeFiles\kv_engine.dir\cmake_clean_target.cmake
 	$(CMAKE_COMMAND) -E cmake_link_script CMakeFiles\kv_engine.dir\link.txt --verbose=$(VERBOSE)
 

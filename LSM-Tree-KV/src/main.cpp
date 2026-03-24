@@ -1,52 +1,94 @@
 #include "engine/storage_engine.h"
 #include <iostream>
-#include <cassert>
+#include <string>
+#include <vector>
+#include <filesystem>
 
 using namespace kv_engine;
+namespace fs = std::filesystem;
 
-void run_persistence_test() {
-    const std::string wal_path = "wal.log";
+void cleanup_test_dir(const std::string& dir) {
+    if (fs::exists(dir)) {
+        fs::remove_all(dir);
+    }
+}
 
-    // --- SESSION 1: Create and Write ---
-    std::cout << "\n--- Session 1: Writing Data ---" << std::endl;
+// TEST 1: Crash and Recover (WAL Test)
+void test_crash_and_recover() {
+    std::cout << "\n--- [Test 1] Crash and Recover (WAL) ---" << std::endl;
+    std::string test_dir = "./test_crash";
+    cleanup_test_dir(test_dir);
+
     {
-        StorageEngine engine(wal_path);
-        engine.Put("user_1", "Alice");
-        engine.Put("user_2", "Bob");
-        engine.Put("status", "Active");
-        
-        std::cout << "Data committed to WAL. Destroying engine now..." << std::endl;
-        // Engine goes out of scope here and is DESTROYED
+        StorageEngine engine(test_dir);
+        engine.Put("session_1", "active");
+        engine.Put("user_id", "101");
+        std::cout << "Data written to WAL. Crashing engine..." << std::endl;
     }
 
-    std::cout << "Engine is now DEAD. Memory is cleared." << std::endl;
+    // Recreate engine and check if WAL replayed into MemTable
+    StorageEngine engine(test_dir);
+    auto val = engine.Get("user_id");
+    if (val && *val == "101") {
+        std::cout << "✅ SUCCESS: WAL replayed successfully." << std::endl;
+    } else {
+        std::cout << "❌ FAILURE: WAL data lost." << std::endl;
+    }
+}
 
-    // --- SESSION 2: Recreate and Verify ---
-    std::cout << "\n--- Session 2: Recovering Data ---" << std::endl;
+// TEST 2: Persist to Disk (SSTable Test)
+void test_persist_to_disk() {
+    std::cout << "\n--- [Test 2] Persist to Disk (SSTable) ---" << std::endl;
+    std::string test_dir = "./test_disk";
+    cleanup_test_dir(test_dir);
+
     {
-        StorageEngine engine(wal_path);
+        StorageEngine engine(test_dir);
+        // We put 8 keys. Since THRESHOLD = 5, the first 5 will flush to 000001.sst
+        // The remaining 3 will stay in the new 000002.log
+        std::cout << "Writing 8 keys to trigger a flush..." << std::endl;
+        engine.Put("key_1", "Value 1"); // SSTable 1
+        engine.Put("key_2", "Value 2"); // SSTable 1
+        engine.Put("key_3", "Value 3"); // SSTable 1
+        engine.Put("key_4", "Value 4"); // SSTable 1
+        engine.Put("key_5", "Value 5"); // SSTable 1 (FLUSH TRIGGERED HERE)
         
-        // Check if the data "survived" the destruction of the first engine
-        auto val1 = engine.Get("user_1");
-        auto val2 = engine.Get("user_2");
-        auto val3 = engine.Get("status");
+        engine.Put("key_6", "Value 6"); // WAL 2
+        engine.Put("key_7", "Value 7"); // WAL 2
+        engine.Put("key_8", "Value 8"); // WAL 2
+        
+        std::cout << "Closing engine. MemTable for keys 1-5 is now cleared from RAM." << std::endl;
+    }
 
-        if (val1 && *val1 == "Alice" && val2 && *val2 == "Bob") {
-            std::cout << "✅ SUCCESS: Data recovered from WAL!" << std::endl;
-            std::cout << "user_1: " << *val1 << std::endl;
-            std::cout << "user_2: " << *val2 << std::endl;
-        } else {
-            std::cout << "❌ FAILURE: Data was lost!" << std::endl;
-        }
+    std::cout << "Restarting engine. Loading Manifest and scanning SSTables..." << std::endl;
+    StorageEngine engine(test_dir);
+
+    // Verify key from SSTable (Disk)
+    auto v1 = engine.Get("key_1");
+    // Verify key from WAL (New Active Log)
+    auto v8 = engine.Get("key_8");
+
+    bool success = true;
+    if (!v1 || *v1 != "Value 1") {
+        std::cout << "❌ FAILURE: Could not retrieve key_1 from SSTable!" << std::endl;
+        success = false;
+    }
+    if (!v8 || *v8 != "Value 8") {
+        std::cout << "❌ FAILURE: Could not retrieve key_8 from WAL!" << std::endl;
+        success = false;
+    }
+
+    if (success) {
+        std::cout << "✅ SUCCESS: Data retrieved from both SSTable and WAL!" << std::endl;
     }
 }
 
 int main() {
     try {
-        run_persistence_test();
+        test_crash_and_recover();
+        test_persist_to_disk();
     } catch (const std::exception& e) {
-        std::cerr << "Error: " << e.what() << std::endl;
-        return 1;
+        std::cerr << "Global Error: " << e.what() << std::endl;
     }
     return 0;
 }
