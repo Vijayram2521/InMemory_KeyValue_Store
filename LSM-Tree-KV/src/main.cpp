@@ -83,10 +83,34 @@ void test_persist_to_disk() {
     }
 }
 
+// TEST 3: Resurrection Bug (Tombstone Handling)
+void test_resurrection_bug() {
+    StorageEngine engine("test_db");
+    std::cout << "\n--- [Test 3] Resurrection Bug (Tombstone Handling) ---" << std::endl;
+    // 1. Initial State
+    engine.Put("user_1", "active");
+    engine.ForceFlush(); // Ensure it hits the disk as an SSTable
+    
+    // 2. The Delete
+    engine.Delete("user_1"); 
+    engine.Put("user_2", "active"); 
+    engine.ForceFlush(); 
+    
+    // 3. The "Crash" (Simulate by closing and reopening)
+    if(engine.Get("user_1").has_value()) {
+        std::cout << "user_1 : " << *engine.Get("user_1") << std::endl;
+        std::cout << "❌ FAILURE: user_1 should be deleted but is still retrievable!" << std::endl;
+    } else {
+        std::cout << "✅ SUCCESS: user_1 correctly marked as deleted." << std::endl;
+    }
+
+}
+
 int main() {
     try {
         test_crash_and_recover();
         test_persist_to_disk();
+        test_resurrection_bug();
     } catch (const std::exception& e) {
         std::cerr << "Global Error: " << e.what() << std::endl;
     }

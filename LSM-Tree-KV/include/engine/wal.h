@@ -5,6 +5,7 @@
 #include <fstream>
 #include <mutex>
 #include <map>
+#include <set>
 
 enum class LogOp : char {
     PUT = 1,
@@ -17,13 +18,13 @@ public:
     ~WAL();
 
     // Appends a write operation to the log file
-    bool append(LogOp op, const std::string& key, const std::string& value = "");
+    bool append(LogOp op, uint64_t sequence,const std::string& key, const std::string& value = "");
 
     // Flushes buffers to physical disk
     void flush();
 
     // Recovers the MemTable state from the log file
-    void recover(std::map<std::string, std::string>& memtable);
+    void recover(std::map<std::string, std::string>& memtable, std::set<std::string>& tombstones);
 
 private:
     std::ofstream log_file;

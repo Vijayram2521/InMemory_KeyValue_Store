@@ -1,6 +1,7 @@
 #include "../include/engine/wal.h"
 #include <iostream>
 #include <map>
+#include <set>
 
 WAL::WAL(const std::string& filepath) : path(filepath) {
     // Open in append and binary mode
@@ -16,7 +17,7 @@ WAL::~WAL() {
     }
 }
 
-bool WAL::append(LogOp op, const std::string& key, const std::string& value) {
+bool WAL::append(LogOp op, uint64_t sequence,const std::string& key, const std::string& value) {
     std::lock_guard<std::mutex> lock(write_mutex);
 
     char type = static_cast<char>(op);
@@ -25,6 +26,7 @@ bool WAL::append(LogOp op, const std::string& key, const std::string& value) {
 
     try {
         log_file.write(&type, sizeof(type));
+        log_file.write(reinterpret_cast<const char*>(&sequence), sizeof(sequence));
         log_file.write(reinterpret_cast<const char*>(&kLen), sizeof(kLen));
         log_file.write(key.data(), kLen);
         
@@ -40,32 +42,38 @@ bool WAL::append(LogOp op, const std::string& key, const std::string& value) {
     }
 }
 
-void WAL::recover(std::map<std::string, std::string>& memtable) {
+// Update this in wal.h and wal.cpp
+void WAL::recover(std::map<std::string, std::string>& memtable, std::set<std::string>& tombstones) {
     std::ifstream reader(path, std::ios::binary | std::ios::in);
-    if (!reader.is_open()) return; // No log file yet, that's fine
+    if (!reader || !reader.is_open()) return;
 
     while (reader.peek() != EOF) {
         char type_raw;
-        uint32_t kLen, vLen;
+        uint64_t sequence;
+        uint32_t kLen;
 
-        // 1. Read Type
-        reader.read(&type_raw, sizeof(type_raw));
+        if (!reader.read(&type_raw, sizeof(type_raw))) break;
         LogOp op = static_cast<LogOp>(type_raw);
-
-        // 2. Read Key
-        reader.read(reinterpret_cast<char*>(&kLen), sizeof(kLen));
-        std::string key(kLen, ' ');
+        
+        // Read the sequence we added earlier
+        if (!reader.read(reinterpret_cast<char*>(&sequence), sizeof(sequence))) break;
+        
+        // Read Key
+        if (!reader.read(reinterpret_cast<char*>(&kLen), sizeof(kLen))) break;
+        std::string key(kLen, '\0');
         reader.read(&key[0], kLen);
 
         if (op == LogOp::PUT) {
-            // 3. Read Value
-            reader.read(reinterpret_cast<char*>(&vLen), sizeof(vLen));
-            std::string value(vLen, ' ');
+            uint32_t vLen;
+            if (!reader.read(reinterpret_cast<char*>(&vLen), sizeof(vLen))) break;
+            std::string value(vLen, '\0');
             reader.read(&value[0], vLen);
             
-            memtable[key] = value; // Restore to memory
+            memtable[key] = value; 
+            tombstones.erase(key); // If it was previously deleted, a new PUT revives it
         } else if (op == LogOp::DELETE) {
-            memtable.erase(key); // Replay the deletion
+            memtable.erase(key);    // Remove from RAM
+            tombstones.insert(key); // Add to the "Death Row" for the next flush
         }
     }
 }

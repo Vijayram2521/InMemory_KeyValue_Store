@@ -33,7 +33,11 @@ namespace kv_engine {
              * Note: In LSM-trees, this is usually a "Tombstone" write.
              */
             bool Delete(const std::string& key);
-        
+
+            /**
+             * Forces a flush of the MemTable to disk.
+             */
+            void ForceFlush();
         private:
             // Mem Table management and WAL handling
             struct Impl;
