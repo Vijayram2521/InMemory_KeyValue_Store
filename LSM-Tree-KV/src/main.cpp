@@ -3,116 +3,26 @@
 #include <string>
 #include <vector>
 #include <filesystem>
+#include "tests.h"
 
 using namespace kv_engine;
 namespace fs = std::filesystem;
 
-void cleanup_test_dir(const std::string& dir) {
-    if (fs::exists(dir)) {
-        fs::remove_all(dir);
-    }
-}
-
-// TEST 1: Crash and Recover (WAL Test)
-void test_crash_and_recover() {
-    std::cout << "\n--- [Test 1] Crash and Recover (WAL) ---" << std::endl;
-    std::string test_dir = "./TestStorage/test_crash";
-    cleanup_test_dir(test_dir);
-
-    {
-        StorageEngine engine(test_dir);
-        engine.Put("session_1", "active");
-        engine.Put("user_id", "101");
-        std::cout << "Data written to WAL. Crashing engine..." << std::endl;
-    }
-
-    // Recreate engine and check if WAL replayed into MemTable
-    StorageEngine engine(test_dir);
-    auto val = engine.Get("user_id");
-    if (val && *val == "101") {
-        std::cout << "✅ SUCCESS: WAL replayed successfully." << std::endl;
-    } else {
-        std::cout << "❌ FAILURE: WAL data lost." << std::endl;
-    }
-}
-
-// TEST 2: Persist to Disk (SSTable Test)
-void test_persist_to_disk() {
-    std::cout << "\n--- [Test 2] Persist to Disk (SSTable) ---" << std::endl;
-    std::string test_dir = "./TestStorage/test_disk";
-    cleanup_test_dir(test_dir);
-
-    {
-        StorageEngine engine(test_dir);
-        // We put 8 keys. Since THRESHOLD = 5, the first 5 will flush to 000001.sst
-        // The remaining 3 will stay in the new 000002.log
-        std::cout << "Writing 8 keys to trigger a flush..." << std::endl;
-        engine.Put("key_1", "Value 1"); // SSTable 1
-        engine.Put("key_2", "Value 2"); // SSTable 1
-        engine.Put("key_3", "Value 3"); // SSTable 1
-        engine.Put("key_4", "Value 4"); // SSTable 1
-        engine.Put("key_5", "Value 5"); // SSTable 1 (FLUSH TRIGGERED HERE)
-        
-        engine.Put("key_6", "Value 6"); // WAL 2
-        engine.Put("key_7", "Value 7"); // WAL 2
-        engine.Put("key_8", "Value 8"); // WAL 2
-        
-        std::cout << "Closing engine. MemTable for keys 1-5 is now cleared from RAM." << std::endl;
-    }
-
-    std::cout << "Restarting engine. Loading Manifest and scanning SSTables..." << std::endl;
-    StorageEngine engine(test_dir);
-
-    // Verify key from SSTable (Disk)
-    auto v1 = engine.Get("key_1");
-    // Verify key from WAL (New Active Log)
-    auto v8 = engine.Get("key_8");
-
-    bool success = true;
-    if (!v1 || *v1 != "Value 1") {
-        std::cout << "❌ FAILURE: Could not retrieve key_1 from SSTable!" << std::endl;
-        success = false;
-    }
-    if (!v8 || *v8 != "Value 8") {
-        std::cout << "❌ FAILURE: Could not retrieve key_8 from WAL!" << std::endl;
-        success = false;
-    }
-
-    if (success) {
-        std::cout << "✅ SUCCESS: Data retrieved from both SSTable and WAL!" << std::endl;
-    }
-}
-
-// TEST 3: Resurrection Bug (Tombstone Handling)
-void test_resurrection_bug() {
-    StorageEngine engine("./TestStorage/test_db");
-    std::cout << "\n--- [Test 3] Resurrection Bug (Tombstone Handling) ---" << std::endl;
-    // 1. Initial State
-    engine.Put("user_1", "active");
-    engine.ForceFlush(); // Ensure it hits the disk as an SSTable
-    
-    // 2. The Delete
-    engine.Delete("user_1"); 
-    engine.Put("user_2", "active"); 
-    engine.ForceFlush(); 
-    
-    // 3. The "Crash" (Simulate by closing and reopening)
-    if(engine.Get("user_1").has_value()) {
-        std::cout << "user_1 : " << *engine.Get("user_1") << std::endl;
-        std::cout << "❌ FAILURE: user_1 should be deleted but is still retrievable!" << std::endl;
-    } else {
-        std::cout << "✅ SUCCESS: user_1 correctly marked as deleted." << std::endl;
-    }
-
-}
-
 int main() {
     try {
-        test_crash_and_recover();
-        test_persist_to_disk();
-        test_resurrection_bug();
+        kv_tests::run_test_wal();
+        std::cout << std::endl;
+        
+        kv_tests::run_test_sstable();
+        std::cout << std::endl;
+        
+        kv_tests::run_test_tombstone();
+        std::cout << std::endl;
+
+        std::cout << "All tests completed." << std::endl;
     } catch (const std::exception& e) {
-        std::cerr << "Global Error: " << e.what() << std::endl;
+        std::cerr << "Test Suite crashed with error: " << e.what() << std::endl;
+        return 1;
     }
     return 0;
 }

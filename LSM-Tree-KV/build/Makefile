@@ -129,24 +129,24 @@ kv_engine/fast:
 .PHONY : kv_engine/fast
 
 #=============================================================================
-# Target rules for targets named lsm_cli
+# Target rules for targets named kv_tests
 
 # Build rule for target.
-lsm_cli: cmake_check_build_system
-	$(MAKE) $(MAKESILENT) -f CMakeFiles\Makefile2 lsm_cli
-.PHONY : lsm_cli
+kv_tests: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\Makefile2 kv_tests
+.PHONY : kv_tests
 
 # fast build rule for target.
-lsm_cli/fast:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles\lsm_cli.dir\build.make CMakeFiles/lsm_cli.dir/build
-.PHONY : lsm_cli/fast
+kv_tests/fast:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\kv_tests.dir\build.make CMakeFiles/kv_tests.dir/build
+.PHONY : kv_tests/fast
 
 src/main.obj: src/main.cpp.obj
 .PHONY : src/main.obj
 
 # target to build an object file
 src/main.cpp.obj:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles\lsm_cli.dir\build.make CMakeFiles/lsm_cli.dir/src/main.cpp.obj
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\kv_tests.dir\build.make CMakeFiles/kv_tests.dir/src/main.cpp.obj
 .PHONY : src/main.cpp.obj
 
 src/main.i: src/main.cpp.i
@@ -154,7 +154,7 @@ src/main.i: src/main.cpp.i
 
 # target to preprocess a source file
 src/main.cpp.i:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles\lsm_cli.dir\build.make CMakeFiles/lsm_cli.dir/src/main.cpp.i
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\kv_tests.dir\build.make CMakeFiles/kv_tests.dir/src/main.cpp.i
 .PHONY : src/main.cpp.i
 
 src/main.s: src/main.cpp.s
@@ -162,7 +162,7 @@ src/main.s: src/main.cpp.s
 
 # target to generate assembly for a file
 src/main.cpp.s:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles\lsm_cli.dir\build.make CMakeFiles/lsm_cli.dir/src/main.cpp.s
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\kv_tests.dir\build.make CMakeFiles/kv_tests.dir/src/main.cpp.s
 .PHONY : src/main.cpp.s
 
 src/manifest.obj: src/manifest.cpp.obj
@@ -261,6 +261,78 @@ src/wal.cpp.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles\kv_engine.dir\build.make CMakeFiles/kv_engine.dir/src/wal.cpp.s
 .PHONY : src/wal.cpp.s
 
+tests/test_sstable.obj: tests/test_sstable.cpp.obj
+.PHONY : tests/test_sstable.obj
+
+# target to build an object file
+tests/test_sstable.cpp.obj:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\kv_tests.dir\build.make CMakeFiles/kv_tests.dir/tests/test_sstable.cpp.obj
+.PHONY : tests/test_sstable.cpp.obj
+
+tests/test_sstable.i: tests/test_sstable.cpp.i
+.PHONY : tests/test_sstable.i
+
+# target to preprocess a source file
+tests/test_sstable.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\kv_tests.dir\build.make CMakeFiles/kv_tests.dir/tests/test_sstable.cpp.i
+.PHONY : tests/test_sstable.cpp.i
+
+tests/test_sstable.s: tests/test_sstable.cpp.s
+.PHONY : tests/test_sstable.s
+
+# target to generate assembly for a file
+tests/test_sstable.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\kv_tests.dir\build.make CMakeFiles/kv_tests.dir/tests/test_sstable.cpp.s
+.PHONY : tests/test_sstable.cpp.s
+
+tests/test_tombstone.obj: tests/test_tombstone.cpp.obj
+.PHONY : tests/test_tombstone.obj
+
+# target to build an object file
+tests/test_tombstone.cpp.obj:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\kv_tests.dir\build.make CMakeFiles/kv_tests.dir/tests/test_tombstone.cpp.obj
+.PHONY : tests/test_tombstone.cpp.obj
+
+tests/test_tombstone.i: tests/test_tombstone.cpp.i
+.PHONY : tests/test_tombstone.i
+
+# target to preprocess a source file
+tests/test_tombstone.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\kv_tests.dir\build.make CMakeFiles/kv_tests.dir/tests/test_tombstone.cpp.i
+.PHONY : tests/test_tombstone.cpp.i
+
+tests/test_tombstone.s: tests/test_tombstone.cpp.s
+.PHONY : tests/test_tombstone.s
+
+# target to generate assembly for a file
+tests/test_tombstone.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\kv_tests.dir\build.make CMakeFiles/kv_tests.dir/tests/test_tombstone.cpp.s
+.PHONY : tests/test_tombstone.cpp.s
+
+tests/test_wal.obj: tests/test_wal.cpp.obj
+.PHONY : tests/test_wal.obj
+
+# target to build an object file
+tests/test_wal.cpp.obj:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\kv_tests.dir\build.make CMakeFiles/kv_tests.dir/tests/test_wal.cpp.obj
+.PHONY : tests/test_wal.cpp.obj
+
+tests/test_wal.i: tests/test_wal.cpp.i
+.PHONY : tests/test_wal.i
+
+# target to preprocess a source file
+tests/test_wal.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\kv_tests.dir\build.make CMakeFiles/kv_tests.dir/tests/test_wal.cpp.i
+.PHONY : tests/test_wal.cpp.i
+
+tests/test_wal.s: tests/test_wal.cpp.s
+.PHONY : tests/test_wal.s
+
+# target to generate assembly for a file
+tests/test_wal.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\kv_tests.dir\build.make CMakeFiles/kv_tests.dir/tests/test_wal.cpp.s
+.PHONY : tests/test_wal.cpp.s
+
 # Help Target
 help:
 	@echo The following are some of the valid targets for this Makefile:
@@ -270,7 +342,7 @@ help:
 	@echo ... edit_cache
 	@echo ... rebuild_cache
 	@echo ... kv_engine
-	@echo ... lsm_cli
+	@echo ... kv_tests
 	@echo ... src/main.obj
 	@echo ... src/main.i
 	@echo ... src/main.s
@@ -286,6 +358,15 @@ help:
 	@echo ... src/wal.obj
 	@echo ... src/wal.i
 	@echo ... src/wal.s
+	@echo ... tests/test_sstable.obj
+	@echo ... tests/test_sstable.i
+	@echo ... tests/test_sstable.s
+	@echo ... tests/test_tombstone.obj
+	@echo ... tests/test_tombstone.i
+	@echo ... tests/test_tombstone.s
+	@echo ... tests/test_wal.obj
+	@echo ... tests/test_wal.i
+	@echo ... tests/test_wal.s
 .PHONY : help
 
 

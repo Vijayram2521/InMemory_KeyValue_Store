@@ -63,12 +63,12 @@ CMAKE_BINARY_DIR = D:\MemCache\InMemory_KeyValue_Store\LSM-Tree-KV\build
 
 # The main recursive "all" target.
 all: CMakeFiles/kv_engine.dir/all
-all: CMakeFiles/lsm_cli.dir/all
+all: CMakeFiles/kv_tests.dir/all
 .PHONY : all
 
 # The main recursive "codegen" target.
 codegen: CMakeFiles/kv_engine.dir/codegen
-codegen: CMakeFiles/lsm_cli.dir/codegen
+codegen: CMakeFiles/kv_tests.dir/codegen
 .PHONY : codegen
 
 # The main recursive "preinstall" target.
@@ -77,7 +77,7 @@ preinstall:
 
 # The main recursive "clean" target.
 clean: CMakeFiles/kv_engine.dir/clean
-clean: CMakeFiles/lsm_cli.dir/clean
+clean: CMakeFiles/kv_tests.dir/clean
 .PHONY : clean
 
 #=============================================================================
@@ -113,36 +113,36 @@ CMakeFiles/kv_engine.dir/clean:
 .PHONY : CMakeFiles/kv_engine.dir/clean
 
 #=============================================================================
-# Target rules for target CMakeFiles/lsm_cli.dir
+# Target rules for target CMakeFiles/kv_tests.dir
 
 # All Build rule for target.
-CMakeFiles/lsm_cli.dir/all: CMakeFiles/kv_engine.dir/all
-	$(MAKE) $(MAKESILENT) -f CMakeFiles\lsm_cli.dir\build.make CMakeFiles/lsm_cli.dir/depend
-	$(MAKE) $(MAKESILENT) -f CMakeFiles\lsm_cli.dir\build.make CMakeFiles/lsm_cli.dir/build
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=D:\MemCache\InMemory_KeyValue_Store\LSM-Tree-KV\build\CMakeFiles --progress-num=6,7 "Built target lsm_cli"
-.PHONY : CMakeFiles/lsm_cli.dir/all
+CMakeFiles/kv_tests.dir/all: CMakeFiles/kv_engine.dir/all
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\kv_tests.dir\build.make CMakeFiles/kv_tests.dir/depend
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\kv_tests.dir\build.make CMakeFiles/kv_tests.dir/build
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=D:\MemCache\InMemory_KeyValue_Store\LSM-Tree-KV\build\CMakeFiles --progress-num=6,7,8,9,10 "Built target kv_tests"
+.PHONY : CMakeFiles/kv_tests.dir/all
 
 # Build rule for subdir invocation for target.
-CMakeFiles/lsm_cli.dir/rule: cmake_check_build_system
-	$(CMAKE_COMMAND) -E cmake_progress_start D:\MemCache\InMemory_KeyValue_Store\LSM-Tree-KV\build\CMakeFiles 7
-	$(MAKE) $(MAKESILENT) -f CMakeFiles\Makefile2 CMakeFiles/lsm_cli.dir/all
+CMakeFiles/kv_tests.dir/rule: cmake_check_build_system
+	$(CMAKE_COMMAND) -E cmake_progress_start D:\MemCache\InMemory_KeyValue_Store\LSM-Tree-KV\build\CMakeFiles 10
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\Makefile2 CMakeFiles/kv_tests.dir/all
 	$(CMAKE_COMMAND) -E cmake_progress_start D:\MemCache\InMemory_KeyValue_Store\LSM-Tree-KV\build\CMakeFiles 0
-.PHONY : CMakeFiles/lsm_cli.dir/rule
+.PHONY : CMakeFiles/kv_tests.dir/rule
 
 # Convenience name for target.
-lsm_cli: CMakeFiles/lsm_cli.dir/rule
-.PHONY : lsm_cli
+kv_tests: CMakeFiles/kv_tests.dir/rule
+.PHONY : kv_tests
 
 # codegen rule for target.
-CMakeFiles/lsm_cli.dir/codegen:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles\lsm_cli.dir\build.make CMakeFiles/lsm_cli.dir/codegen
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=D:\MemCache\InMemory_KeyValue_Store\LSM-Tree-KV\build\CMakeFiles --progress-num=6,7 "Finished codegen for target lsm_cli"
-.PHONY : CMakeFiles/lsm_cli.dir/codegen
+CMakeFiles/kv_tests.dir/codegen:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\kv_tests.dir\build.make CMakeFiles/kv_tests.dir/codegen
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=D:\MemCache\InMemory_KeyValue_Store\LSM-Tree-KV\build\CMakeFiles --progress-num=6,7,8,9,10 "Finished codegen for target kv_tests"
+.PHONY : CMakeFiles/kv_tests.dir/codegen
 
 # clean rule for target.
-CMakeFiles/lsm_cli.dir/clean:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles\lsm_cli.dir\build.make CMakeFiles/lsm_cli.dir/clean
-.PHONY : CMakeFiles/lsm_cli.dir/clean
+CMakeFiles/kv_tests.dir/clean:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\kv_tests.dir\build.make CMakeFiles/kv_tests.dir/clean
+.PHONY : CMakeFiles/kv_tests.dir/clean
 
 #=============================================================================
 # Special targets to cleanup operation of make.

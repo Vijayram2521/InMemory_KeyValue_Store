@@ -5,10 +5,12 @@ project(LSM_KV_Store)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Tell CMake where to find your .h files
+# Include directories so headers can be found
+# include/ contains engine headers, tests/ contains tests.h
 include_directories(include)
+include_directories(tests)
 
-# Create the library from your implementation
+# 1. Create the engine library from the implementations in src/
 add_library(
     kv_engine 
     src/storage_engine.cpp 
@@ -17,6 +19,22 @@ add_library(
     src/sstable.cpp
 )
 
-# Create the executable and link it to the library
-add_executable(lsm_cli src/main.cpp)
-target_link_libraries(lsm_cli kv_engine)
+# 2. Define Test Sources
+# Note: main.cpp is now correctly mapped to src/main.cpp
+set(TEST_SOURCES
+    src/main.cpp
+    tests/test_wal.cpp
+    tests/test_sstable.cpp
+    tests/test_tombstone.cpp
+)
+
+# 3. Create the Test Executable
+add_executable(kv_tests ${TEST_SOURCES})
+
+# 4. Link the executable to the library
+target_link_libraries(kv_tests kv_engine)
+
+# 5. Support for Filesystem in older GCC/MinGW versions
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_link_libraries(kv_tests stdc++fs)
+endif()
