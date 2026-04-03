@@ -16,7 +16,7 @@ void cleanup_test_dir(const std::string& dir) {
 // TEST 1: Crash and Recover (WAL Test)
 void test_crash_and_recover() {
     std::cout << "\n--- [Test 1] Crash and Recover (WAL) ---" << std::endl;
-    std::string test_dir = "./test_crash";
+    std::string test_dir = "./TestStorage/test_crash";
     cleanup_test_dir(test_dir);
 
     {
@@ -39,7 +39,7 @@ void test_crash_and_recover() {
 // TEST 2: Persist to Disk (SSTable Test)
 void test_persist_to_disk() {
     std::cout << "\n--- [Test 2] Persist to Disk (SSTable) ---" << std::endl;
-    std::string test_dir = "./test_disk";
+    std::string test_dir = "./TestStorage/test_disk";
     cleanup_test_dir(test_dir);
 
     {
@@ -85,7 +85,7 @@ void test_persist_to_disk() {
 
 // TEST 3: Resurrection Bug (Tombstone Handling)
 void test_resurrection_bug() {
-    StorageEngine engine("test_db");
+    StorageEngine engine("./TestStorage/test_db");
     std::cout << "\n--- [Test 3] Resurrection Bug (Tombstone Handling) ---" << std::endl;
     // 1. Initial State
     engine.Put("user_1", "active");
