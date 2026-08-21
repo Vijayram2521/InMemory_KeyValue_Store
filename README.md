@@ -162,6 +162,7 @@ Lookup: seek to EOF-20, read footer --> binary_search(index) in memory
 ### Phase 5: Optimization & Efficiency
 * [ ] **Bloom Filters:** Implement a bitmask (Probabilistic Data Structure) for each SSTable to skip disk I/O for keys that definitely do not exist in that file.
 * [ ] **Compaction (L0 -> L1):** Develop a background worker to merge fragmented SSTables, discard obsolete versions, and clear out processed tombstones.
+* [ ] **Cold-cache benchmarking:** The Linux/Docker RPS numbers in the "Benchmarking" section above all reflect a warm OS page cache (reads immediately follow the write phase that produced the same dataset). Get a genuine cold-cache number too -- e.g. drop caches between phases, or read data written by a prior, separate `docker run` -- for a fuller "worst case" picture alongside the current "best case" numbers.
 
 ### Phase 6: Advanced Features
 * [ ] **Block Compression:** Snappy or LZ4 compression for SSTable blocks to reduce disk footprint.
@@ -215,6 +216,17 @@ there's one source of truth. Run `kv_benchmark --help` (or read the sizing
 comment at the top of `src/benchmark.cpp`) for the full derivation and flag
 list.
 
+```bash
+# Large-scale preset: same 1,000,000-write dataset (well under 3GB of disk),
+# but 10,000,000 reads instead of 5,000 -- two orders of magnitude more
+# read samples for a far more statistically stable RPS number.
+./scripts/run_benchmark_docker_large.sh    # bash
+./scripts/run_benchmark_docker_large.ps1   # PowerShell
+```
+A thin preset over the same script above (just pre-sets `WRITES`/`READS`,
+no duplicated logic) -- see "Large-scale results" below for the numbers
+this produced.
+
 **How the default 1,000,000-write workload was sized:** at an average
 on-disk record size of ~563 bytes (9 bytes of framing + ~10-byte key +
 average 544-byte value), 1,000,000 writes lands at ~563MB of SSTable data on
@@ -237,22 +249,39 @@ generations, 4 threads), in two very different environments:
 |---|---|---|---|
 | Windows 11, native (x86_64, NTFS) | 200,000 reads | ~226.8 | ~58K |
 | Windows 11, native (x86_64, NTFS) | 5,000 reads, cache-warm | ~339.0 | ~63K |
-| **Linux, Docker container (ARM64, Oracle Ampere A1, `--memory=4g`)** | 2,000,000 reads | **~363,252** | **~90K** |
 | Linux, Docker container (ARM64, Oracle Ampere A1, `--memory=4g`) | 5,000 reads | ~190,404 | ~88K |
+| Linux, Docker container (ARM64, Oracle Ampere A1, `--memory=4g`) | 2,000,000 reads | ~363,252 | ~90K |
+| **Linux, Docker container (ARM64, Oracle Ampere A1, `--memory=4g`)** | **10,000,000 reads** | **~351,649** | **~89.5K** |
 
 The Linux/Docker numbers are not a like-for-like recheck of the Windows
 ones -- different CPU architecture (Ampere ARM64 vs. x86_64), different
 filesystem (ext4/overlayfs vs. NTFS), and Windows file `open()` calls carry
 overhead (real-time antivirus scanning, NTFS metadata) that Linux's VFS
 largely doesn't. Both are honestly reported rather than picking the
-flattering one. The Linux number is validated against a large sample
-(2,000,000 reads, 5.5s, exact 85%/15% hit/miss split as requested) so it's
-not a small-sample fluke -- RPS went *up*, not down, when the sample grew
-400x from the initial 5,000-read run. It reflects a warm-page-cache
-scenario (reads immediately follow the write phase that produced the same
-~563MB dataset, which easily fits in the VM's 32GB RAM), so treat it as
-"best case, data is hot," not a promise that a cold read against a much
-larger, disk-resident dataset would be this fast.
+flattering one. It reflects a warm-page-cache scenario (reads immediately
+follow the write phase that produced the same dataset, which easily fits in
+the VM's 32GB RAM), so treat it as "best case, data is hot," not a promise
+that a cold read against a much larger, disk-resident dataset would be this
+fast (see the cold-cache follow-up noted in the roadmap below).
+
+**Large-scale results (`run_benchmark_docker_large`):** the numbers above
+could be small-sample artifacts, so they were checked against progressively
+bigger read samples on the same 1,000,000-key dataset (~1.13GB on disk,
+comfortably under a 3GB budget) -- 5,000, then 2,000,000, then
+**10,000,000** reads. RPS stayed in a tight band the whole way (190K -> 363K
+-> 352K), including at 2,000x the original sample size, which is what makes
+this a real sustained-throughput number rather than a lucky small sample:
+
+* **1,000,000 writes:** 11.18s, **~89,470 WPS**, ~563MB of SSTable data (4
+  generations) -- matches the sizing calculation to within 0.4%, as before.
+* **10,000,000 reads:** 28.44s, **~351,649 RPS**, exactly the requested
+  85%/15% hit/miss split (8,500,000 hits / 1,500,000 misses).
+* Total run: ~40s, on hardware that cost nothing extra to provision (the
+  same VM already used for the numbers above).
+
+Reproduce with `./scripts/run_benchmark_docker_large.sh` (or `.ps1`) -- a
+thin preset over the same Docker script above, just with `WRITES=1000000
+READS=10000000` pre-set.
 
 Either way, this is **up from ~1.75 RPS** before the index existed --
 roughly two to five orders of magnitude, depending on environment. The
