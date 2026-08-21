@@ -34,6 +34,7 @@ set(TEST_SOURCES
     src/main.cpp
     tests/test_wal.cpp
     tests/test_sstable.cpp
+    tests/test_sstable_index.cpp
     tests/test_tombstone.cpp
     tests/test_manifest.cpp
     tests/test_storage_engine.cpp

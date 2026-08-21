@@ -17,6 +17,9 @@ int main() {
         kv_tests::run_test_sstable();
         std::cout << std::endl;
 
+        kv_tests::run_test_sstable_index();
+        std::cout << std::endl;
+
         kv_tests::run_test_tombstone();
         std::cout << std::endl;
 

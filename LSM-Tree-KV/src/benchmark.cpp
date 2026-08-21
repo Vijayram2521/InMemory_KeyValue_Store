@@ -18,14 +18,24 @@
 // every on-disk record identical, which is not how real workloads look and
 // makes per-record cost trivially predictable).
 //
-// Step 1 -- calibrate the real bottleneck. SSTable::search_file (sstable.cpp)
-// reopens the file and does a full linear scan on *every* Get call; there is
-// no sparse index or bloom filter yet (Phase 4/5 on the README roadmap).
-// Measured locally: a single-generation, 100,000-record SSTable (~11.8MB, at
-// the OLD fixed 100B value size) averaged 116.5ms per Get (40 reads / 4.66s,
-// single-threaded) => ~1.165us of scan cost per record in the file. That
-// number is what actually limits how large a workload this benchmark can run
-// in a reasonable amount of time -- see kCalibratedScanCostPerRecordUs below.
+// Step 1 -- calibrate the real bottleneck. This used to be a full linear
+// scan per Get (SSTable::search_file reopened the file and scanned every
+// record on every call) -- calibrated at the time at ~1.165us of scan cost
+// per record in the file, i.e. read cost scaled with total records written.
+// That's fixed now: every SSTable carries a full sorted index (Key -> Byte
+// Offset) plus a footer, built once at flush()/startup time and cached in
+// StorageEngine, not rebuilt per lookup. SSTable::search_with_index binary
+// searches the cached index in memory, then does exactly one seekg + read.
+// Measured locally (1,000,000 writes, 4 generations, 4 threads): read
+// throughput went from ~1.75 RPS (linear scan) to ~226.8 RPS sustained
+// (200,000 reads / 882s) -- a ~129x improvement, and read latency is no
+// longer proportional to how much data has been written. The remaining
+// ~4.4ms average per Get is now dominated by std::ifstream's open() cost
+// (one open per SSTable a lookup has to touch -- up to all 4 generations
+// for a guaranteed miss, which must check every generation to conclude
+// "not found"), not by scanning. That's the next bottleneck to attack --
+// bloom filters (Phase 5 on the README roadmap) would let a miss skip
+// opening a file at all instead of just skipping the scan inside it.
 //
 // Step 2 -- pick a target dataset size relative to the 2GB container. We
 // target ~512MiB of SSTable data on disk: a quarter of the container's
@@ -54,31 +64,32 @@
 // Step 3 -- bound peak RAM (the actual thing that could OOM the container).
 // The memtable (std::map<string,string> + a tombstone set) holds at most
 // `memtable-threshold` records before it's flushed and cleared, so *that*,
-// not total writes, is what determines peak in-flight memory. Budgeting
-// generously for map-node + std::string heap overhead (~1.5-2x raw bytes):
-// 250,000 records x ~600B/record (avg) ~= 150MB peak memtable, ~7% of the
-// 2GB budget -- comfortable headroom. That threshold also splits the 1M
-// writes into 4 SSTable generations, which calibration showed barely
-// affects read cost at this scale (record-scan time dominates over the
-// per-file open() cost once files are non-trivially sized).
+// not total writes, is what determines peak in-flight memtable memory.
+// Budgeting generously for map-node + std::string heap overhead (~1.5-2x
+// raw bytes): 250,000 records x ~600B/record (avg) ~= 150MB peak memtable,
+// ~7% of the 2GB budget. On top of that, StorageEngine now keeps every
+// SSTable's index resident in memory for the engine's whole lifetime (see
+// index_cache in storage_engine.cpp) -- unlike the memtable, this is never
+// evicted, so it grows with *total* writes, not just the current
+// generation: ~1,000,000 index entries x ~40B/entry (a short SSO string +
+// an 8-byte offset) ~= 40MB, ~2% of the budget. Both comfortably fit; the
+// index cache is the one to watch if --writes is raised far beyond the
+// default, since it has no eviction policy yet.
 //
-// Step 4 -- keep the DEFAULT run finishing in a reasonable time. Read cost
-// is intrinsically ~O(total records already written) per Get under the
-// current linear-scan design (miss => scan every generation fully; hit =>
-// scan ~half the dataset on average): the model predicts average Get latency
-// ~= 0.575 * writes * kCalibratedScanCostPerRecordUs, i.e. ~670ms/read
-// single-threaded at 1,000,000 writes. So the DEFAULT --reads is
-// intentionally modest (100) to keep a default invocation bounded.
-//
-// Verified empirically: a full default run (1,000,000 writes, 100 reads, 4
-// threads) took ~17.7s to write (~56K WPS) and ~57s to read (~1.75 RPS,
-// i.e. ~570ms/read) -- matching the single-threaded prediction almost
-// exactly, because 4-way read parallelism barely helped here (~1.2x, not
-// 4x): each Get is dominated by sequential file-scan CPU work under one
-// shared_lock-held file handle per thread, which this environment's
-// disk/scheduler didn't parallelize well. Total default run: ~75 seconds.
-// Raise --reads yourself if you want a longer, more statistically stable
-// run (and are willing to wait roughly writes * 0.575us per extra read).
+// Step 4 -- pick a DEFAULT --reads that's actually statistically meaningful
+// now that reads are cheap. Verified empirically (1,000,000 writes, 4
+// generations, 4 threads): sustained read throughput is ~226.8 RPS
+// (200,000 reads / 882s), a ~129x improvement over the ~1.75 RPS the old
+// linear-scan design measured at this same scale. A too-small --reads
+// (the old default of 100, chosen when every read cost ~570ms) now finishes
+// in well under a second and is dominated by one-time setup noise (thread
+// spawn, op-plan shuffle) rather than steady-state throughput -- not a
+// useful RPS sample any more. Verified: 5,000 reads (the new default) took
+// ~14.8s (~339 RPS this run -- some run-to-run variance vs. the 200,000-read
+// calibration above, plausibly page-cache warmth right after the write
+// phase), for a full default run (write + read) of ~31s total -- actually
+// *faster* than the old default's ~75s despite sampling 50x more reads.
+// Raise --reads yourself for an even more stable sample; it's cheap now.
 #include "engine/storage_engine.h"
 
 #include <algorithm>
@@ -100,13 +111,13 @@ namespace {
 
 // See the file-level comment above for how these were derived.
 constexpr size_t kDefaultWrites = 1'000'000;
-constexpr size_t kDefaultReads = 100;
+constexpr size_t kDefaultReads = 5'000;
 constexpr size_t kDefaultMemtableThreshold = 250'000;
 constexpr size_t kDefaultMinValueSize = 64;
 constexpr size_t kDefaultMaxValueSize = 1024;
 constexpr double kDefaultMissRate = 0.15;
 constexpr unsigned kDefaultThreads = 4;
-constexpr double kCalibratedScanCostPerRecordUs = 1.165;
+constexpr double kCalibratedSustainedRps = 226.8;
 
 struct BenchConfig {
     std::string data_dir = "./bench_data";
@@ -147,15 +158,15 @@ void print_usage() {
         "  --data-dir=PATH         engine data directory (default ./bench_data)\n"
         "  --keep-data             do not delete data-dir when done\n"
         "  --help                  show this message\n\n"
-        "Note: every SSTable lookup opens the file and does a full linear scan (sparse\n"
-        "indexing / bloom filters are future roadmap items), so read cost is roughly\n"
-        "proportional to total records written so far, not just to the number of SSTable\n"
-        "files. Calibrated locally at ~" << kCalibratedScanCostPerRecordUs
-              << "us of scan time per record in a file; expected average Get latency is\n"
-        "roughly 0.575 * writes * " << kCalibratedScanCostPerRecordUs
-              << "us (see the file-level comment in benchmark.cpp for the full derivation).\n"
-        "Raise --writes or --reads deliberately, not by accident -- they directly trade off\n"
-        "against how long the read phase takes.\n";
+        "Note: every SSTable lookup binary-searches that file's cached index and does a\n"
+        "single seekg -- there's no linear scan, so read cost no longer grows with total\n"
+        "records written. Calibrated locally at ~" << kCalibratedSustainedRps
+              << " sustained RPS (1,000,000 writes,\n"
+        "4 generations, 4 threads); the current bottleneck is one std::ifstream open() per\n"
+        "SSTable a lookup has to touch (up to all of them, for a guaranteed miss), not\n"
+        "scanning -- bloom filters would let a miss skip that file-open entirely.\n"
+        "Raise --writes or --reads deliberately, not by accident -- they still cost time,\n"
+        "just far less than before.\n";
 }
 
 bool parse_flag(const std::string& arg, const std::string& name, std::string& out) {

@@ -10,6 +10,7 @@
 #include <algorithm>
 #include "engine/sstable.h"
 #include <set>
+#include <unordered_map>
 
 namespace kv_engine {
 
@@ -21,13 +22,21 @@ std::string format_seq(uint64_t seq) {
 
 struct StorageEngine::Impl {
     std::map<std::string, std::string> memtable;
-    std::shared_mutex rw_lock; 
+    std::shared_mutex rw_lock;
     std::unique_ptr<WAL> wal;
     uint64_t current_seq;
     std::string data_dir;
     std::vector<std::string> sstable_files;
     std::set<std::string> tombstones;
     size_t THRESHOLD;
+    // Every SSTable's index, keyed by its file path. Populated once here at
+    // startup (for generations recovered via the Manifest) or immediately
+    // on flush() (for generations this process writes itself) -- never
+    // lazily inside Get(), because Get() only takes a shared_lock and
+    // multiple readers mutating this map concurrently would race. flush()
+    // always runs under Put()/Delete()'s unique_lock, so it's safe to
+    // mutate here without extra locking.
+    std::unordered_map<std::string, std::vector<IndexEntry>> index_cache;
 
     Impl(const std::string& dir, size_t threshold) : data_dir(dir), THRESHOLD(threshold) {
         std::filesystem::create_directories(data_dir);
@@ -36,6 +45,7 @@ struct StorageEngine::Impl {
         for (const auto& entry : history) {
             std::string full_path = (std::filesystem::path(data_dir) / entry.filename).string();
             sstable_files.push_back(full_path);
+            index_cache[full_path] = SSTable::load_index(full_path);
         }
         current_seq = history.empty() ? 0 : history.back().sequence + 1;
 
@@ -61,10 +71,14 @@ struct StorageEngine::Impl {
         std::string sst_path = get_sst_path(current_seq);
         std::cout << "--- Persisting Generation " << current_seq << " to Disk ---" << std::endl;
 
-        // 1. Write the SSTable using both the map and the tombstone set
-        if (SSTable::write_file(sst_path, memtable, tombstones)) {
-            
-            // 2. Register the new file in the Manifest 
+        // 1. Write the SSTable (data + index + footer) using both the map
+        // and the tombstone set, capturing the index built while writing so
+        // we can cache it directly without re-reading the file.
+        std::vector<IndexEntry> index;
+        if (SSTable::write_file(sst_path, memtable, tombstones, index)) {
+            index_cache[sst_path] = std::move(index);
+
+            // 2. Register the new file in the Manifest
             // This persists the filename and the current "timestamp"
             Manifest::add_entry(data_dir, format_seq(current_seq) + ".sst", current_seq);
 
@@ -135,11 +149,13 @@ std::optional<std::string> StorageEngine::Get(const std::string& key) {
         return it->second;
     }
 
-    // Search SSTables newest to oldest
+    // Search SSTables newest to oldest. Each lookup is a binary search over
+    // that file's cached index (built at flush()/startup time, never here)
+    // plus a single seek+read on a hit -- no linear scan of the file.
     for (auto rit = pImpl->sstable_files.rbegin(); rit != pImpl->sstable_files.rend(); ++rit) {
-        // We will need to update SSTable::search_file to return a 'SearchResult' 
-        // that distinguishes between "Not Found" and "Found a Tombstone"
-        auto result = SSTable::search_file(*rit, key); 
+        auto cache_it = pImpl->index_cache.find(*rit);
+        if (cache_it == pImpl->index_cache.end()) continue; // shouldn't happen; defensive
+        auto result = SSTable::search_with_index(*rit, cache_it->second, key);
         if (result.found) {
             if (result.is_tombstone) return std::nullopt;
             return result.value;

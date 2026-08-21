@@ -2,8 +2,8 @@
 
 A high-performance, persistent Key-Value storage engine built from scratch in C++. This project implements a **Log-Structured Merge-Tree (LSM-Tree)** architecture, modeled after industry standards like RocksDB and AlloyDB, optimized for high write throughput and durable storage.
 
-## 📊 Project Status: Phase 3 Complete (Persistence & Search)
-We have successfully transitioned from a volatile in-memory store to a durable engine capable of surviving crashes and managing on-disk sorted files.
+## 📊 Project Status: Phase 4 Complete (Indexed Search)
+We have successfully transitioned from a volatile in-memory store to a durable engine capable of surviving crashes, managing on-disk sorted files, and finding a key in any of them without scanning the file.
 
 ### Completed Features
 * **Durable Write-Ahead Log (WAL):** Every operation is logged to an append-only binary file with sequence numbers before touching RAM, ensuring zero data loss on crashes.
@@ -11,8 +11,10 @@ We have successfully transitioned from a volatile in-memory store to a durable e
 * **Tombstone System:** Implemented "Death Markers" (Type 2 records) to handle deletions across multiple files, preventing deleted data from "resurrecting" during reads.
 * **Manifest Versioning:** A global `MANIFEST` file tracks the chronological order of SSTables, allowing the engine to rebuild its state correctly upon restart.
 * **Multi-Layered Search:** * **First-Hit Logic:** Search order flows from `MemTable` → `Tombstone Set` → `SSTables` (Newest to Oldest).
-    * **Binary Search Ready:** SSTables are written in sorted order, laying the groundwork for indexed lookups.
+    * **Indexed Point Lookups:** Every SSTable carries a full sorted index (`Key -> Byte Offset`) plus a fixed footer; a lookup binary-searches the index in memory, then does one `seekg` straight to the record. No SSTable is ever linearly scanned to answer a `Get`.
 * **Thread-Safety:** Utilizes `std::shared_mutex` for a "Single Writer, Multiple Reader" concurrency model.
+* **Test Suite:** Real assertions (not print-and-eyeball output) via a small header-only framework, wired into CTest. 31 checks covering WAL crash recovery, SSTable flush/restart, tombstone resurrection, Manifest, StorageEngine edge cases (overwrite, delete-then-revive), and the SSTable index/binary-search path directly.
+* **Throughput Benchmark:** `kv_benchmark` times writes and reads separately against a workload sized deliberately against a 2GB memory budget (see "Benchmarking" below), with every value an independently random size and 15% of reads guaranteed misses -- runnable natively or in a Docker container capped at `--memory=2g`.
 
 ---
 
@@ -23,17 +25,139 @@ The engine utilizes a layered approach to balance speed and durability:
 1.  **WAL (Write-Ahead Log):** The immediate on-disk recovery log.
 2.  **MemTable:** Active in-memory `std::map` providing $O(\log N)$ writes and reads.
 3.  **Tombstone Set:** In-memory tracking of deleted keys to short-circuit reads.
-4.  **SSTables:** Immutable, sorted binary files on disk representing snapshots of history.
+4.  **SSTables:** Immutable, sorted binary files on disk representing snapshots of history. Each file is `[data block][index block][footer]`; puts and tombstones are merged into one ascending-key sequence during the flush so the index (and binary search over it) stays valid regardless of record type.
 5.  **Manifest:** The "Source of Truth" that manages the list of active SSTables and current sequence numbers.
+6.  **Index Cache:** An in-memory `unordered_map<sstable path, index>` inside `StorageEngine`, populated once per file (at flush time for new generations, at startup for generations recovered via the Manifest) and never rebuilt on the read path.
+
+### Write Path
+```
+    +-----------------------+
+    |         Client        |
+    | Put(k, v) / Delete(k) |
+    +-----------------------+
+                 |
+                 v
+     +----------------------+
+     |    StorageEngine     |
+     | unique_lock(rw_lock) |
+     +----------------------+
+                 |
+                 v
+   +-------------------------+
+   |           WAL           |
+   | append record + flush() |
+   +-------------------------+
+                 |
+                 v
+     +----------------------+
+     |       MemTable       |
+     | std::map<key, value> |
+     +----------------------+
+                 |
+                 v   size >= THRESHOLD ?
+           +---------+
+           | flush() |
+           +---------+
+                 |
+                 v
+  +----------------------------+
+  |  SSTable written to disk   |
+  | [ data | index | footer ]  |
+  | (puts + tombstones merged  |
+  |  into one sorted sequence) |
+  +----------------------------+
+                 |
+                 v
+ +-----------------------------+
+ |           Manifest          |
+ | append new generation entry |
+ +-----------------------------+
+                 |
+                 v
+  +----------------------------+
+  |        Index Cache         |
+  | cache the index just built |
+  |   (no re-read from disk)   |
+  +----------------------------+
+```
+
+### Read Path
+```
+            +--------+
+            | Client |
+            | Get(k) |
+            +--------+
+                 |
+                 v
+     +----------------------+
+     |    StorageEngine     |
+     | shared_lock(rw_lock) |
+     +----------------------+
+                 |
+                 v
+       +------------------+
+       | 1. Tombstone Set |   present? --> return nullopt (it's deleted)
+       |   (in-memory)    |
+       +------------------+
+                 | not present
+                 v
+         +-------------+
+         | 2. MemTable |   present? --> return value
+         |   std::map  |
+         +-------------+
+                 | not present
+                 v
+ +-----------------------------+
+ |         3. SSTables         |
+ | newest -> oldest generation |
+ +-----------------------------+
+                 |
+                 v   for each generation, newest first:
+      +--------------------+
+      |    Index Cache     |
+      | binary_search(key) |
+      +--------------------+
+                 |
+                 v
+              found in this file's index?
+                |
+                +-- yes --> seekg(offset) --> read exactly 1 record
+                |             --> value, or nullopt if it's a tombstone
+                |
+                +-- no  --> try the next (older) generation
+                             (or return nullopt if none left)
+```
+
+### SSTable On-Disk Layout
+```
++--------------------------------------------------------------------------+
+|                                                                          |
+|                             One SSTable File                             |
+|                                                                          |
+|  +----------------------+  +----------------------+  +----------------+  |
+|  |      Data Block      |  |     Index Block      |  |     Footer     |  |
+|  | PUT/DELETE records,  |  | key -> byte offset,  |  |   20 bytes:    |  |
+|  |   merged into ONE    |  |  same ascending-key  |  | index_offset,  |  |
+|  | ascending-key order  |  |  order as the data   |  |  index_count,  |  |
+|  |   (never scanned)    |  |                      |  |  magic number  |  |
+|  +----------------------+  +----------------------+  +----------------+  |
+|                                                                          |
+|  byte offset 0           offset = end of data      offset = EOF-20       |
++--------------------------------------------------------------------------+
+
+Lookup: seek to EOF-20, read footer --> binary_search(index) in memory
+        --> seekg(matched byte offset) --> read exactly 1 record --> done
+        (a key not found in the index is not in the file -- no scan fallback)
+```
 
 ---
 
 ## 🗺️ Roadmap: What's Next?
 
-### Phase 4: High-Performance Search (Indexing)
-* [ ] **Sparse Indexing:** Append an index block to the end of SSTables to store `Key -> Byte Offset` every 16th record.
-* [ ] **Footer Implementation:** Add a fixed-size footer to SSTables for instant index location.
-* [ ] **Point Lookups:** Replace linear file scans with `seekg` jumps based on binary-searched index offsets.
+### Phase 4: High-Performance Search (Indexing) -- ✅ Complete
+* [x] **Full Indexing:** Every SSTable carries a complete `Key -> Byte Offset` index, not a sparse one. The roadmap originally called for indexing every 16th record; a full index was chosen instead because the overhead is small (~3% of file size at this project's typical value sizes) and it avoids the extra "scan forward from the nearest indexed neighbor" step a sparse index requires -- simpler and strictly O(log n) with no scan component at all. Revisit sparse indexing only if index memory becomes a real constraint at a much larger scale than currently benchmarked.
+* [x] **Footer Implementation:** A fixed 20-byte footer (index offset, index entry count, magic number) at a known offset from EOF lets a lookup jump straight to the index without scanning for it.
+* [x] **Point Lookups:** `SSTable::search_with_index` binary-searches the cached index and does exactly one `seekg` + read on a hit; there is no scan fallback. Measured locally: read throughput on the benchmark's default 1,000,000-write / 4-generation workload went from ~1.75 RPS (full linear scan per lookup) to **~150-340 RPS** depending on OS file-cache state (see the "Benchmarking" section below for the full numbers and how the range was measured) -- see `src/benchmark.cpp`'s sizing comment for the before/after methodology.
 
 ### Phase 5: Optimization & Efficiency
 * [ ] **Bloom Filters:** Implement a bitmask (Probabilistic Data Structure) for each SSTable to skip disk I/O for keys that definitely do not exist in that file.
@@ -85,7 +209,7 @@ Optional env overrides: `WRITES`, `READS`, `MIN_VALUE_SIZE`,
 `MAX_VALUE_SIZE`, `MISS_RATE`, `THREADS`, `MEMTABLE_THRESHOLD`,
 `MEMORY_LIMIT` (default `2g`). Leave any of them unset and the container
 falls back to `kv_benchmark`'s own compiled-in defaults (1,000,000 writes,
-100 reads, memtable-threshold 250,000, value sizes 64-1024 bytes) -- the
+5,000 reads, memtable-threshold 250,000, value sizes 64-1024 bytes) -- the
 Dockerfile and scripts deliberately don't re-hardcode those numbers, so
 there's one source of truth. Run `kv_benchmark --help` (or read the sizing
 comment at the top of `src/benchmark.cpp`) for the full derivation and flag
@@ -97,14 +221,25 @@ average 544-byte value), 1,000,000 writes lands at ~563MB of SSTable data on
 disk -- about a quarter of the container's 2GB budget, verified empirically
 (4 SSTables totaling 562.9MB, within 0.4% of the calculation). The
 `memtable-threshold` of 250,000 keeps the in-flight memtable's peak RAM
-around ~150MB (~7% of the budget), comfortably inside the 2GB limit.
+around ~150MB (~7% of the budget); the index cache (see Phase 4 below) adds
+another ~40MB across all 1,000,000 indexed keys. Both comfortably inside the
+2GB limit.
 
-**Note on scale:** every SSTable lookup today opens the file and does a full
-linear scan (no sparse index or bloom filter yet -- see the Phase 4/5
-roadmap below), so read cost is roughly proportional to *total records
-written*, not just to SSTable count. Calibrated locally at ~1.165us of scan
-time per record in a file, the default workload (1,000,000 writes) averages
-~570ms per Get -- verified empirically at ~57s for the default 100 reads
-(~1.75 RPS), with the full default run (write + read) taking ~75s total.
-Raise `WRITES` or `READS` deliberately, not by accident -- they trade off
-directly against how long the read phase takes.
+**Read performance:** every SSTable lookup binary-searches that file's
+cached index (built once, not per lookup) and does a single `seekg` -- no
+linear scan. Measured at this default scale (1,000,000 writes, 4
+generations, 4 threads) across three separate runs with different read
+sample sizes: **149.7 RPS** (50,000 reads), **226.8 RPS** (200,000 reads),
+and **339.0 RPS** (5,000 reads, right after a write phase with a warm OS
+file cache). Real sustained throughput lands somewhere in that **~150-340
+RPS** range depending on file-cache state and system load -- up from ~1.75
+RPS before the index existed, i.e. **roughly 85x-195x** faster, and read
+cost no longer grows with total data written the way it used to. The
+200,000-read sample is the most statistically reliable single number (large
+sample, less exposed to cache-warmth noise), so **~227 RPS** is the figure
+to quote if you need one. The full default run (1,000,000 writes + 5,000
+reads) takes ~31s total. The current bottleneck is one `std::ifstream`
+`open()` per SSTable a lookup has to touch (a guaranteed miss must open all
+of them), not scanning -- bloom filters (Phase 5 below) would let a miss
+skip that open entirely. Raise `WRITES` or `READS` deliberately, not by
+accident -- they still cost time, just far less than before.
