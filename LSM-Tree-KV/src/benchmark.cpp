@@ -122,6 +122,7 @@
 #include <mutex>
 #include <numeric>
 #include <random>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -339,10 +340,18 @@ private:
                 std::chrono::steady_clock::now() - start_).count();
             double pct = total_ > 0
                 ? 100.0 * static_cast<double>(done) / static_cast<double>(total_) : 0.0;
-            std::cout << "[progress] " << phase_name_ << ": " << done << "/" << total_
-                      << " (" << std::fixed << std::setprecision(1) << pct << "%) "
-                      << "elapsed=" << std::fixed << std::setprecision(1) << elapsed << "s\n"
-                      << std::flush;
+            // Build the line in a local stream, not directly on std::cout --
+            // std::fixed/setprecision are persistent stream-state changes,
+            // not scoped to one operator<< chain, so applying them straight
+            // to std::cout here would silently truncate every subsequent
+            // cout write in the whole program to 1 decimal place (this
+            // genuinely happened: the final --- Results --- block came out
+            // misformatted, e.g. "0.15" printed as "0.1", after this ran).
+            std::ostringstream line;
+            line << "[progress] " << phase_name_ << ": " << done << "/" << total_
+                 << " (" << std::fixed << std::setprecision(1) << pct << "%) "
+                 << "elapsed=" << std::fixed << std::setprecision(1) << elapsed << "s\n";
+            std::cout << line.str() << std::flush;
         }
     }
 
