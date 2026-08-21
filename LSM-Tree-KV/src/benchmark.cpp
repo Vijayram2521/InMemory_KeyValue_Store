@@ -114,9 +114,12 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdlib>
 #include <filesystem>
+#include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <numeric>
 #include <random>
 #include <string>
@@ -149,6 +152,7 @@ struct BenchConfig {
     size_t memtable_threshold = kDefaultMemtableThreshold;
     unsigned threads = kDefaultThreads;
     bool keep_data = false;
+    std::chrono::seconds progress_interval{10}; // 0 disables progress lines entirely
 };
 
 void print_usage() {
@@ -184,6 +188,12 @@ void print_usage() {
         "  --threads=N             worker threads for each phase (default "
               << kDefaultThreads << ")\n"
         "  --data-dir=PATH         engine data directory (default ./bench_data)\n"
+        "  --progress-interval=N   seconds between \"[progress] ...\" status lines during\n"
+        "                          each phase (default 10; 0 disables them). Long phases\n"
+        "                          otherwise produce zero stdout output until they finish\n"
+        "                          entirely, which looks identical to a hang and can also\n"
+        "                          trip idle-connection timeouts on whatever's capturing\n"
+        "                          this process's output over a long-lived pipe (e.g. SSH).\n"
         "  --keep-data             do not delete data-dir when done\n"
         "  --help                  show this message\n\n"
         "Note: every SSTable lookup binary-searches that file's cached index and does a\n"
@@ -232,6 +242,8 @@ BenchConfig parse_args(int argc, char** argv) {
             cfg.threads = static_cast<unsigned>(std::stoul(val));
         } else if (parse_flag(arg, "data-dir", val)) {
             cfg.data_dir = val;
+        } else if (parse_flag(arg, "progress-interval", val)) {
+            cfg.progress_interval = std::chrono::seconds(std::stoll(val));
         } else if (arg == "--keep-data") {
             cfg.keep_data = true;
         } else {
@@ -287,6 +299,64 @@ std::vector<std::pair<size_t, size_t>> split_range(size_t total, unsigned parts)
     return ranges;
 }
 
+// Prints "[progress] <phase>: done/total (pct%) elapsed=Ws" every `period`
+// on a background thread, so a long phase (the read phase especially,
+// which otherwise produces zero stdout output until it's entirely done)
+// stays visibly alive instead of looking hung -- both to a human watching
+// and to anything capturing this process's output over a connection that
+// might time out during a long silent stretch. RAII: starts on
+// construction, stops and joins on destruction (wrap it in a scope around
+// the phase's worker loop).
+class ProgressReporter {
+public:
+    ProgressReporter(std::string phase_name, const std::atomic<size_t>& counter, size_t total,
+                      std::chrono::seconds period)
+        : phase_name_(std::move(phase_name)), counter_(counter), total_(total), period_(period) {
+        if (period_.count() <= 0) return; // disabled
+        start_ = std::chrono::steady_clock::now();
+        thread_ = std::thread([this] { run(); });
+    }
+
+    ~ProgressReporter() {
+        if (!thread_.joinable()) return;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        thread_.join();
+    }
+
+    ProgressReporter(const ProgressReporter&) = delete;
+    ProgressReporter& operator=(const ProgressReporter&) = delete;
+
+private:
+    void run() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        while (!cv_.wait_for(lock, period_, [this] { return stop_; })) {
+            size_t done = counter_.load();
+            double elapsed = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - start_).count();
+            double pct = total_ > 0
+                ? 100.0 * static_cast<double>(done) / static_cast<double>(total_) : 0.0;
+            std::cout << "[progress] " << phase_name_ << ": " << done << "/" << total_
+                      << " (" << std::fixed << std::setprecision(1) << pct << "%) "
+                      << "elapsed=" << std::fixed << std::setprecision(1) << elapsed << "s\n"
+                      << std::flush;
+        }
+    }
+
+    std::string phase_name_;
+    const std::atomic<size_t>& counter_;
+    size_t total_;
+    std::chrono::seconds period_;
+    std::chrono::steady_clock::time_point start_;
+    bool stop_ = false;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::thread thread_;
+};
+
 struct WriteResult {
     double seconds = 0.0;
     size_t total_value_bytes = 0;
@@ -296,22 +366,29 @@ WriteResult run_write_phase(StorageEngine& engine, const BenchConfig& cfg) {
     auto ranges = split_range(cfg.writes, cfg.threads);
     std::vector<std::thread> workers;
     std::atomic<size_t> total_value_bytes{0};
+    std::atomic<size_t> done{0};
 
     auto t0 = std::chrono::steady_clock::now();
-    for (unsigned t = 0; t < cfg.threads; ++t) {
-        auto [lo, hi] = ranges[t];
-        workers.emplace_back([&engine, &cfg, &total_value_bytes, lo, hi, t] {
-            std::mt19937_64 rng(1000 + t);
-            size_t local_bytes = 0;
-            for (size_t i = lo; i < hi; ++i) {
-                std::string value = make_value(cfg.min_value_size, cfg.max_value_size, rng);
-                local_bytes += value.size();
-                engine.Put(hit_key(i), value);
-            }
-            total_value_bytes += local_bytes;
-        });
+    {
+        ProgressReporter progress("write", done, cfg.writes, cfg.progress_interval);
+        for (unsigned t = 0; t < cfg.threads; ++t) {
+            auto [lo, hi] = ranges[t];
+            workers.emplace_back([&engine, &cfg, &total_value_bytes, &done, lo, hi, t] {
+                std::mt19937_64 rng(1000 + t);
+                size_t local_bytes = 0;
+                size_t local_done = 0;
+                for (size_t i = lo; i < hi; ++i) {
+                    std::string value = make_value(cfg.min_value_size, cfg.max_value_size, rng);
+                    local_bytes += value.size();
+                    engine.Put(hit_key(i), value);
+                    if (++local_done % 1000 == 0) done += 1000;
+                }
+                done += local_done % 1000;
+                total_value_bytes += local_bytes;
+            });
+        }
+        for (auto& w : workers) w.join();
     }
-    for (auto& w : workers) w.join();
     auto t1 = std::chrono::steady_clock::now();
 
     WriteResult r;
@@ -339,17 +416,24 @@ DeleteResult run_delete_phase(StorageEngine& engine, const BenchConfig& cfg) {
 
     auto ranges = split_range(indices.size(), cfg.threads);
     std::vector<std::thread> workers;
+    std::atomic<size_t> done{0};
 
     auto t0 = std::chrono::steady_clock::now();
-    for (unsigned t = 0; t < cfg.threads; ++t) {
-        auto [lo, hi] = ranges[t];
-        workers.emplace_back([&engine, &indices, lo, hi] {
-            for (size_t i = lo; i < hi; ++i) {
-                engine.Delete(hit_key(indices[i]));
-            }
-        });
+    {
+        ProgressReporter progress("delete", done, indices.size(), cfg.progress_interval);
+        for (unsigned t = 0; t < cfg.threads; ++t) {
+            auto [lo, hi] = ranges[t];
+            workers.emplace_back([&engine, &indices, &done, lo, hi] {
+                size_t local_done = 0;
+                for (size_t i = lo; i < hi; ++i) {
+                    engine.Delete(hit_key(indices[i]));
+                    if (++local_done % 1000 == 0) done += 1000;
+                }
+                done += local_done % 1000;
+            });
+        }
+        for (auto& w : workers) w.join();
     }
-    for (auto& w : workers) w.join();
     auto t1 = std::chrono::steady_clock::now();
 
     DeleteResult r;
@@ -387,16 +471,20 @@ ReadResult run_read_phase(StorageEngine& engine, const BenchConfig& cfg) {
     auto ranges = split_range(plan.size(), cfg.threads);
     std::vector<std::thread> workers;
     std::atomic<size_t> hits{0}, misses{0};
+    std::atomic<size_t> done{0};
 
     auto t0 = std::chrono::steady_clock::now();
+    ProgressReporter progress("read", done, plan.size(), cfg.progress_interval);
     for (unsigned t = 0; t < cfg.threads; ++t) {
         auto [lo, hi] = ranges[t];
-        workers.emplace_back([&engine, &plan, &hits, &misses, lo, hi] {
-            size_t local_hits = 0, local_misses = 0;
+        workers.emplace_back([&engine, &plan, &hits, &misses, &done, lo, hi] {
+            size_t local_hits = 0, local_misses = 0, local_done = 0;
             for (size_t i = lo; i < hi; ++i) {
                 auto v = engine.Get(plan[i]);
                 if (v.has_value()) ++local_hits; else ++local_misses;
+                if (++local_done % 1000 == 0) done += 1000;
             }
+            done += local_done % 1000;
             hits += local_hits;
             misses += local_misses;
         });
