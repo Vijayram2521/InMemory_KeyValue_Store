@@ -157,7 +157,7 @@ Lookup: seek to EOF-20, read footer --> binary_search(index) in memory
 ### Phase 4: High-Performance Search (Indexing) -- ✅ Complete
 * [x] **Full Indexing:** Every SSTable carries a complete `Key -> Byte Offset` index, not a sparse one. The roadmap originally called for indexing every 16th record; a full index was chosen instead because the overhead is small (~3% of file size at this project's typical value sizes) and it avoids the extra "scan forward from the nearest indexed neighbor" step a sparse index requires -- simpler and strictly O(log n) with no scan component at all. Revisit sparse indexing only if index memory becomes a real constraint at a much larger scale than currently benchmarked.
 * [x] **Footer Implementation:** A fixed 20-byte footer (index offset, index entry count, magic number) at a known offset from EOF lets a lookup jump straight to the index without scanning for it.
-* [x] **Point Lookups:** `SSTable::search_with_index` binary-searches the cached index and does exactly one `seekg` + read on a hit; there is no scan fallback. Measured locally: read throughput on the benchmark's default 1,000,000-write / 4-generation workload went from ~1.75 RPS (full linear scan per lookup) to **~150-340 RPS** depending on OS file-cache state (see the "Benchmarking" section below for the full numbers and how the range was measured) -- see `src/benchmark.cpp`'s sizing comment for the before/after methodology.
+* [x] **Point Lookups:** `SSTable::search_with_index` binary-searches the cached index and does exactly one `seekg` + read on a hit; there is no scan fallback. Measured on the benchmark's default 1,000,000-write / 4-generation workload: read throughput went from ~1.75 RPS (full linear scan per lookup) to **~150-340 RPS on Windows** (native x86_64) and **~190K-363K RPS on Linux** (Docker container, ARM64, warm page cache) -- see the "Benchmarking" section below for the full numbers, environment differences, and how each was measured, and `src/benchmark.cpp`'s sizing comment for the before/after methodology.
 
 ### Phase 5: Optimization & Efficiency
 * [ ] **Bloom Filters:** Implement a bitmask (Probabilistic Data Structure) for each SSTable to skip disk I/O for keys that definitely do not exist in that file.
@@ -231,18 +231,34 @@ rescaled to fill the larger cap, it just has more room to spare.
 **Read performance:** every SSTable lookup binary-searches that file's
 cached index (built once, not per lookup) and does a single `seekg` -- no
 linear scan. Measured at this default scale (1,000,000 writes, 4
-generations, 4 threads) across three separate runs with different read
-sample sizes: **149.7 RPS** (50,000 reads), **226.8 RPS** (200,000 reads),
-and **339.0 RPS** (5,000 reads, right after a write phase with a warm OS
-file cache). Real sustained throughput lands somewhere in that **~150-340
-RPS** range depending on file-cache state and system load -- up from ~1.75
-RPS before the index existed, i.e. **roughly 85x-195x** faster, and read
-cost no longer grows with total data written the way it used to. The
-200,000-read sample is the most statistically reliable single number (large
-sample, less exposed to cache-warmth noise), so **~227 RPS** is the figure
-to quote if you need one. The full default run (1,000,000 writes + 5,000
-reads) takes ~31s total. The current bottleneck is one `std::ifstream`
-`open()` per SSTable a lookup has to touch (a guaranteed miss must open all
-of them), not scanning -- bloom filters (Phase 5 below) would let a miss
-skip that open entirely. Raise `WRITES` or `READS` deliberately, not by
-accident -- they still cost time, just far less than before.
+generations, 4 threads), in two very different environments:
+
+| Environment | Sample | RPS | WPS |
+|---|---|---|---|
+| Windows 11, native (x86_64, NTFS) | 200,000 reads | ~226.8 | ~58K |
+| Windows 11, native (x86_64, NTFS) | 5,000 reads, cache-warm | ~339.0 | ~63K |
+| **Linux, Docker container (ARM64, Oracle Ampere A1, `--memory=4g`)** | 2,000,000 reads | **~363,252** | **~90K** |
+| Linux, Docker container (ARM64, Oracle Ampere A1, `--memory=4g`) | 5,000 reads | ~190,404 | ~88K |
+
+The Linux/Docker numbers are not a like-for-like recheck of the Windows
+ones -- different CPU architecture (Ampere ARM64 vs. x86_64), different
+filesystem (ext4/overlayfs vs. NTFS), and Windows file `open()` calls carry
+overhead (real-time antivirus scanning, NTFS metadata) that Linux's VFS
+largely doesn't. Both are honestly reported rather than picking the
+flattering one. The Linux number is validated against a large sample
+(2,000,000 reads, 5.5s, exact 85%/15% hit/miss split as requested) so it's
+not a small-sample fluke -- RPS went *up*, not down, when the sample grew
+400x from the initial 5,000-read run. It reflects a warm-page-cache
+scenario (reads immediately follow the write phase that produced the same
+~563MB dataset, which easily fits in the VM's 32GB RAM), so treat it as
+"best case, data is hot," not a promise that a cold read against a much
+larger, disk-resident dataset would be this fast.
+
+Either way, this is **up from ~1.75 RPS** before the index existed --
+roughly two to five orders of magnitude, depending on environment. The
+current bottleneck is one `std::ifstream` `open()` per SSTable a lookup has
+to touch (a guaranteed miss must open all of them), not scanning -- bloom
+filters (Phase 5 below) would let a miss skip that open entirely, which
+would matter more on Windows than it apparently does on Linux. Raise
+`WRITES` or `READS` deliberately, not by accident -- they still cost time,
+just far less than before.
