@@ -191,30 +191,37 @@ in-process library (see `src/main.cpp` / `src/benchmark.cpp` for usage
 examples).
 
 ### Benchmarking (Docker)
-`kv_benchmark` times a write phase and a read phase separately against a
-single `StorageEngine`, reporting writes/sec (WPS) and reads/sec (RPS). Every
-value gets its own random size in `[min-value-size, max-value-size]` --
-values are never a fixed size, so nothing about the dataset is artificially
-uniform. By default, 15% of reads target keys that were never written (a
-disjoint key prefix guarantees a genuine miss rather than relying on
-chance), simulating a realistic cache-miss workload; the observed miss rate
-is printed alongside the requested one so you can confirm the split landed
-correctly.
+`kv_benchmark` times up to three phases separately against a single
+`StorageEngine`: writes (WPS), an optional delete phase (DPS -- deletes
+`--deletes` distinct, previously-written keys, sampled without replacement,
+exercising the tombstone path), and reads (RPS). Every value gets its own
+random size in `[min-value-size, max-value-size]` -- values are never a
+fixed size, so nothing about the dataset is artificially uniform. By
+default, 15% of reads target keys that were never written (a disjoint key
+prefix guarantees a genuine miss rather than relying on chance), simulating
+a realistic cache-miss workload; the observed miss rate is printed alongside
+the requested one so you can confirm the split landed correctly (and, if
+`--deletes` is nonzero, the observed rate will read a bit above the
+requested one -- some "hit" targets will have since been deleted, which is
+correct tombstone behavior, not a bug). Every phase also prints periodic
+`[progress] phase: done/total (pct%) elapsed=Ws` status lines
+(`--progress-interval`, default 10s) so a long phase never looks
+indistinguishable from a hang.
 
 ```bash
 # Build the image and run it in a container capped at 4GB of memory
 ./scripts/run_benchmark_docker.sh    # bash
 ./scripts/run_benchmark_docker.ps1   # PowerShell
 ```
-Optional env overrides: `WRITES`, `READS`, `MIN_VALUE_SIZE`,
+Optional env overrides: `WRITES`, `DELETES`, `READS`, `MIN_VALUE_SIZE`,
 `MAX_VALUE_SIZE`, `MISS_RATE`, `THREADS`, `MEMTABLE_THRESHOLD`,
 `MEMORY_LIMIT` (default `4g`). Leave any of them unset and the container
 falls back to `kv_benchmark`'s own compiled-in defaults (1,000,000 writes,
-5,000 reads, memtable-threshold 250,000, value sizes 64-1024 bytes) -- the
-Dockerfile and scripts deliberately don't re-hardcode those numbers, so
-there's one source of truth. Run `kv_benchmark --help` (or read the sizing
-comment at the top of `src/benchmark.cpp`) for the full derivation and flag
-list.
+0 deletes, 5,000 reads, memtable-threshold 250,000, value sizes 64-1024
+bytes) -- the Dockerfile and scripts deliberately don't re-hardcode those
+numbers, so there's one source of truth. Run `kv_benchmark --help` (or read
+the sizing comment at the top of `src/benchmark.cpp`) for the full
+derivation and flag list.
 
 ```bash
 # Large-scale preset: same 1,000,000-write dataset (well under 3GB of disk),
@@ -226,6 +233,16 @@ list.
 A thin preset over the same script above (just pre-sets `WRITES`/`READS`,
 no duplicated logic) -- see "Large-scale results" below for the numbers
 this produced.
+
+```bash
+# Biggest preset: 3,000,000 writes at 100,000 records/generation, delete
+# 300,000 (10%), then 10,000,000 reads -- see "Large-scale,
+# higher-generation-count results" below for what this found.
+./scripts/run_benchmark_docker_biggest.sh    # bash
+./scripts/run_benchmark_docker_biggest.ps1   # PowerShell
+```
+Also a thin preset (`WRITES`/`DELETES`/`READS`/`MEMTABLE_THRESHOLD`/
+`MIN_VALUE_SIZE`/`MAX_VALUE_SIZE` pre-set) over the same script.
 
 **How the default 1,000,000-write workload was sized:** at an average
 on-disk record size of ~563 bytes (9 bytes of framing + ~10-byte key +
@@ -282,6 +299,81 @@ this a real sustained-throughput number rather than a lucky small sample:
 Reproduce with `./scripts/run_benchmark_docker_large.sh` (or `.ps1`) -- a
 thin preset over the same Docker script above, just with `WRITES=1000000
 READS=10000000` pre-set.
+
+**Large-scale, higher-generation-count results (`run_benchmark_docker_biggest`):**
+every number above was measured at 4 SSTable generations. This preset asks a
+different question -- what happens well past that, closer to a keyspace
+that genuinely doesn't fit in memory -- with 3,000,000 writes at 100,000
+records/generation, then deleting 300,000 keys (10%, exercising the
+tombstone path for real, not just via the small correctness tests), then
+10,000,000 reads. Values are 512-4096B (mean ~2304B) instead of the default
+64-1024B, so I/O actually moves meaningful bytes per op:
+
+* **Generation count:** landed at **33**, not the naively-expected 30 --
+  `Delete` can *also* trigger a flush once accumulated tombstones cross
+  `memtable-threshold` (300,000 deletes / 100,000 threshold ~= 3 more),
+  which is easy to miss if you only think about the write phase.
+* **Disk usage:** ~6.9GB of SSTable data (`AVG_VALUE_BYTES` landed at
+  2302.7, essentially exact against the 2304B target), ~18GB total on the
+  VM including retained WAL segments and the Docker image layers -- verified
+  directly with `df -h`, not just calculated.
+* **Peak memory: ~1.2GB (30% of the 4GB cap), confirmed empirically** by
+  sampling `docker stats` throughout the run, not just predicted --
+  comfortably safe, and it stayed roughly flat through the write, delete,
+  *and* read phases rather than spiking at any one of them. This is the
+  concrete answer to "would a keyspace too big to fit in memory cause an
+  OOM": no, because the memtable is bounded by `memtable-threshold`
+  regardless of total keys, and the only component that scales with total
+  writes (the index cache) is small enough (~40B/entry) that it would take
+  on the order of 100,000,000 keys to threaten a 4GB budget on its own.
+* **WPS: ~11,480** (261.3s for 3,000,000 writes) -- lower than the ~89,470
+  WPS at the default value-size range, consistent with writing 4-6x more
+  bytes per record.
+* **DPS: ~149,930** (2.0s for 300,000 deletes) -- deletes are cheap: no
+  value to write, just a WAL append plus an in-memory map/set update.
+* **RPS: ~4,419** (2,262.9s, i.e. ~37.7 minutes, for 10,000,000 reads) --
+  **an ~80x drop from the ~352K RPS measured at 4 generations**, and far
+  worse than a simple "average files touched per lookup" model predicts
+  (that model, based on a miss needing to open all N generations and a hit
+  needing to open roughly N/2 on average, predicts only a ~7x slowdown
+  from 4 to 33 generations, i.e. ~49K RPS). The gap between that prediction
+  and the measured ~4,419 RPS is itself informative: it means real disk/
+  page-cache I/O pressure -- not just the *count* of `open()` calls -- has
+  become the dominant cost once the dataset (~18GB) is large enough that it
+  no longer trivially fits alongside everything else in page cache the way
+  the ~560MB-to-1.13GB 4-generation datasets did. This is exactly the
+  scenario bloom filters and compaction (Phase 5 below) target: bloom
+  filters would let most of that unnecessary `open()`-and-maybe-read
+  traffic never happen at all for keys that provably aren't in a given
+  file, and compaction would keep generation count (and therefore files
+  touched per lookup) bounded as the store grows, instead of growing
+  without limit.
+* **Observed miss rate: 23.5%** against a 15% request (2,350,944 misses /
+  10,000,000 reads) -- consistent with the delete-interaction documented
+  above: 15% guaranteed misses plus ~85% * 10% of "hit" targets landing on
+  a since-deleted key ~= 23.5% predicted, matching almost exactly.
+
+This run also surfaced two real bugs, both fixed the same session rather
+than left in the numbers above: (1) the very first attempt lost its
+results entirely -- a local SSH connection capturing output silently died
+during the ~38-minute, previously-silent read phase (no data flowing long
+enough to trip an idle-connection timeout), and because the container used
+`--rm` with no mounted volume, both the output and the on-disk dataset were
+gone once it exited. Fixed by adding periodic progress logging to
+`kv_benchmark` itself (see above) and, operationally, by launching detached
+on the remote side with output redirected to a file there instead of
+relying on one long-lived local connection. (2) That same progress-logging
+addition introduced a formatting bug -- `std::fixed`/`setprecision` applied
+directly to `std::cout` leaked into all later output, truncating the final
+results block to 1 decimal place (e.g. the requested 0.15 miss rate
+displayed as "0.1"). Caught by noticing the displayed value didn't match
+what was actually requested, root-caused, and fixed by scoping the
+formatting to a local stream instead -- the underlying computed values were
+never wrong, only their display.
+
+Reproduce with `./scripts/run_benchmark_docker_biggest.sh` (or `.ps1`).
+Budget real time for it -- unlike the other presets, the read phase alone
+takes tens of minutes at this generation count, not seconds.
 
 Either way, this is **up from ~1.75 RPS** before the index existed --
 roughly two to five orders of magnitude, depending on environment. The
