@@ -44,3 +44,9 @@
 
 # Test Storage directory
 TestStorage/
+
+# CMake build output
+build/
+
+# Local session tracking (not shared)
+NEXT_STEPS.md

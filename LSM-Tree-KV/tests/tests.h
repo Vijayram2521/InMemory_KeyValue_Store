@@ -14,4 +14,7 @@ namespace kv_tests {
     void run_test_wal();
     void run_test_sstable();
     void run_test_tombstone();
+    void run_test_manifest();
+    void run_test_storage_engine_edge_cases();
+    void run_test_storage_engine_generations();
 }

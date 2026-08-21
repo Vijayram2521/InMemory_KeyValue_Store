@@ -9,7 +9,14 @@
 namespace kv_engine {
     class StorageEngine {
         public : 
-            StorageEngine(const std::string& data_dir = "./data");
+            /**
+             * @param memtable_threshold Number of entries the in-memory table
+             * accumulates before it is flushed to a new SSTable. Defaults to
+             * the historical value used throughout the test suite; callers
+             * that need higher throughput (e.g. benchmarks) can raise it so
+             * they don't end up with one SSTable file per few writes.
+             */
+            StorageEngine(const std::string& data_dir = "./data", size_t memtable_threshold = 5);
             ~StorageEngine() ;
 
             // Prevent copying to avoid multiple engines fighting over the same files

@@ -1,25 +1,22 @@
 #include "engine/storage_engine.h"
 #include "tests.h"
-#include <iostream>
-#include <cassert>
+#include "test_framework.h"
 #include <filesystem>
 
 void kv_tests::run_test_wal() {
-    std::cout << "--- [Test 1] Crash and Recover (WAL) ---" << std::endl;
+    std::cout << "--- [Test] Crash and Recover (WAL) ---" << std::endl;
     std::string path = "./TestStorage/test_crash";
     cleanup_test_dir(path);
 
     {
         kv_engine::StorageEngine engine(path);
-        engine.Put("key_1", "value_1");
-        std::cout << "Data written to WAL. Crashing engine..." << std::endl;
-    } // Scope ends, engine "crashes"
+        KV_CHECK(engine.Put("key_1", "value_1"), "Put succeeds before simulated crash");
+    } // Scope ends, engine "crashes" (no explicit shutdown/flush)
 
     kv_engine::StorageEngine recovery_engine(path);
     auto val = recovery_engine.Get("key_1");
-    if (val && *val == "value_1") {
-        std::cout << "✅ SUCCESS: WAL replayed successfully." << std::endl;
-    } else {
-        std::cout << "❌ FAILURE: WAL recovery failed." << std::endl;
+    KV_CHECK(val.has_value(), "WAL replay recovers key_1 after restart");
+    if (val.has_value()) {
+        KV_CHECK_EQ(std::string("value_1"), *val, "Recovered value matches what was written");
     }
 }

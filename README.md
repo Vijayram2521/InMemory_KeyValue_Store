@@ -55,15 +55,56 @@ The engine utilizes a layered approach to balance speed and durability:
 
 ### Build & Run
 ```bash
-# Create build directory
-mkdir build && cd build
+# From LSM-Tree-KV/, configure, build, and run the unit test suite via CTest
+./scripts/run_tests.sh      # bash / MSYS2
+./scripts/run_tests.ps1     # PowerShell
+```
+This builds two binaries into `build/`: `kv_tests` (the unit test suite,
+registered with CTest) and `kv_benchmark` (the throughput benchmark below).
+There is currently no interactive CLI -- `StorageEngine` is used as an
+in-process library (see `src/main.cpp` / `src/benchmark.cpp` for usage
+examples).
 
-# Configure and compile
-cmake .. -G "MinGW Makefiles"
-cmake --build .
+### Benchmarking (Docker)
+`kv_benchmark` times a write phase and a read phase separately against a
+single `StorageEngine`, reporting writes/sec (WPS) and reads/sec (RPS). Every
+value gets its own random size in `[min-value-size, max-value-size]` --
+values are never a fixed size, so nothing about the dataset is artificially
+uniform. By default, 15% of reads target keys that were never written (a
+disjoint key prefix guarantees a genuine miss rather than relying on
+chance), simulating a realistic cache-miss workload; the observed miss rate
+is printed alongside the requested one so you can confirm the split landed
+correctly.
 
-# Run the automated test suite
-./kv_engine_test.exe
+```bash
+# Build the image and run it in a container capped at 2GB of memory
+./scripts/run_benchmark_docker.sh    # bash
+./scripts/run_benchmark_docker.ps1   # PowerShell
+```
+Optional env overrides: `WRITES`, `READS`, `MIN_VALUE_SIZE`,
+`MAX_VALUE_SIZE`, `MISS_RATE`, `THREADS`, `MEMTABLE_THRESHOLD`,
+`MEMORY_LIMIT` (default `2g`). Leave any of them unset and the container
+falls back to `kv_benchmark`'s own compiled-in defaults (1,000,000 writes,
+100 reads, memtable-threshold 250,000, value sizes 64-1024 bytes) -- the
+Dockerfile and scripts deliberately don't re-hardcode those numbers, so
+there's one source of truth. Run `kv_benchmark --help` (or read the sizing
+comment at the top of `src/benchmark.cpp`) for the full derivation and flag
+list.
 
-# Launch the interactive CLI
-./lsm_cli.exe
+**How the default 1,000,000-write workload was sized:** at an average
+on-disk record size of ~563 bytes (9 bytes of framing + ~10-byte key +
+average 544-byte value), 1,000,000 writes lands at ~563MB of SSTable data on
+disk -- about a quarter of the container's 2GB budget, verified empirically
+(4 SSTables totaling 562.9MB, within 0.4% of the calculation). The
+`memtable-threshold` of 250,000 keeps the in-flight memtable's peak RAM
+around ~150MB (~7% of the budget), comfortably inside the 2GB limit.
+
+**Note on scale:** every SSTable lookup today opens the file and does a full
+linear scan (no sparse index or bloom filter yet -- see the Phase 4/5
+roadmap below), so read cost is roughly proportional to *total records
+written*, not just to SSTable count. Calibrated locally at ~1.165us of scan
+time per record in a file, the default workload (1,000,000 writes) averages
+~570ms per Get -- verified empirically at ~57s for the default 100 reads
+(~1.75 RPS), with the full default run (write + read) taking ~75s total.
+Raise `WRITES` or `READS` deliberately, not by accident -- they trade off
+directly against how long the read phase takes.

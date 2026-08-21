@@ -27,9 +27,9 @@ struct StorageEngine::Impl {
     std::string data_dir;
     std::vector<std::string> sstable_files;
     std::set<std::string> tombstones;
-    const size_t THRESHOLD = 5;
+    size_t THRESHOLD;
 
-    Impl(const std::string& dir) : data_dir(dir) {
+    Impl(const std::string& dir, size_t threshold) : data_dir(dir), THRESHOLD(threshold) {
         std::filesystem::create_directories(data_dir);
 
         auto history = Manifest::load_history(data_dir);
@@ -91,8 +91,8 @@ struct StorageEngine::Impl {
 
 };
 
-StorageEngine::StorageEngine(const std::string& data_dir) 
-    : pImpl(std::make_unique<Impl>(data_dir)) {
+StorageEngine::StorageEngine(const std::string& data_dir, size_t memtable_threshold)
+    : pImpl(std::make_unique<Impl>(data_dir, memtable_threshold)) {
     std::cout << "Engine initialized at: " << data_dir 
               << " | Active Sequence: " << pImpl->current_seq << std::endl;
 }
@@ -107,6 +107,7 @@ bool StorageEngine::Put(const std::string& key, const std::string& value) {
     }
     
     pImpl->memtable[key] = value;
+    pImpl->tombstones.erase(key); // A fresh PUT revives a previously deleted key
 
     // Trigger flush if threshold reached
     if (pImpl->memtable.size() >= pImpl->THRESHOLD) {

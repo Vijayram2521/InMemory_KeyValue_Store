@@ -1,0 +1,8 @@
+build/
+bench_data/
+TestStorage/
+*.log
+*.sst
+*.obj
+*.o
+*.exe
