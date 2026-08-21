@@ -10,7 +10,7 @@
 # are simply not passed through, so this script never hardcodes a number
 # that could drift out of sync with the binary's actual defaults.
 #
-# Optional env overrides: MEMORY_LIMIT (default 4g), WRITES, READS,
+# Optional env overrides: MEMORY_LIMIT (default 4g), WRITES, DELETES, READS,
 #   MIN_VALUE_SIZE, MAX_VALUE_SIZE, MISS_RATE, THREADS, MEMTABLE_THRESHOLD
 #
 # Usage: ./scripts/run_benchmark_docker.sh
@@ -24,6 +24,7 @@ docker build -t "$IMAGE" .
 
 args=(--data-dir=/home/bench/data)
 [ -n "${WRITES:-}" ]             && args+=(--writes="$WRITES")
+[ -n "${DELETES:-}" ]            && args+=(--deletes="$DELETES")
 [ -n "${READS:-}" ]              && args+=(--reads="$READS")
 [ -n "${MIN_VALUE_SIZE:-}" ]     && args+=(--min-value-size="$MIN_VALUE_SIZE")
 [ -n "${MAX_VALUE_SIZE:-}" ]     && args+=(--max-value-size="$MAX_VALUE_SIZE")

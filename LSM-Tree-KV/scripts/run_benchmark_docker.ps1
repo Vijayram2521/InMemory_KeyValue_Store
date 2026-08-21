@@ -9,7 +9,7 @@
 # are simply not passed through, so this script never hardcodes a number
 # that could drift out of sync with the binary's actual defaults.
 #
-# Optional env overrides: MEMORY_LIMIT (default 4g), WRITES, READS,
+# Optional env overrides: MEMORY_LIMIT (default 4g), WRITES, DELETES, READS,
 #   MIN_VALUE_SIZE, MAX_VALUE_SIZE, MISS_RATE, THREADS, MEMTABLE_THRESHOLD
 #
 # Usage: .\scripts\run_benchmark_docker.ps1
@@ -23,6 +23,7 @@ docker build -t $Image .
 
 $benchArgs = @("--data-dir=/home/bench/data")
 if ($env:WRITES)             { $benchArgs += "--writes=$($env:WRITES)" }
+if ($env:DELETES)             { $benchArgs += "--deletes=$($env:DELETES)" }
 if ($env:READS)               { $benchArgs += "--reads=$($env:READS)" }
 if ($env:MIN_VALUE_SIZE)      { $benchArgs += "--min-value-size=$($env:MIN_VALUE_SIZE)" }
 if ($env:MAX_VALUE_SIZE)      { $benchArgs += "--max-value-size=$($env:MAX_VALUE_SIZE)" }

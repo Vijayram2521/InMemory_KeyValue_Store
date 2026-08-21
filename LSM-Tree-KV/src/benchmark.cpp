@@ -1,13 +1,22 @@
 // Standalone throughput benchmark for kv_engine::StorageEngine.
 //
-// Runs two timed phases against a single engine instance:
-//   1. Write phase: `writes` unique Puts, split across `threads`.
-//   2. Read phase:  `reads` Gets, split across `threads`, where a
+// Runs up to three timed phases against a single engine instance:
+//   1. Write phase:  `writes` unique Puts, split across `threads`.
+//   2. Delete phase: `deletes` previously-written keys (sampled without
+//      replacement), split across `threads`. Opt-in -- skipped entirely
+//      when `deletes` is 0 (the default), so existing invocations are
+//      unaffected. Exercises the tombstone path that Get and read-phase
+//      throughput otherwise never touch.
+//   3. Read phase:   `reads` Gets, split across `threads`, where a
 //      `miss-rate` fraction target keys that were never written (a disjoint
 //      key prefix guarantees a true miss rather than relying on chance).
+//      If a deleted key is randomly selected as a "hit" target, Get
+//      correctly returns nullopt -- that's real tombstone behavior, not a
+//      bug, so the observed hit rate reads a bit below --miss-rate's
+//      complement once --deletes is nonzero.
 //
-// Prints machine-parseable KEY=VALUE lines so run scripts can pull WPS/RPS
-// straight out of stdout.
+// Prints machine-parseable KEY=VALUE lines so run scripts can pull
+// WPS/DPS/RPS straight out of stdout.
 //
 // ---------------------------------------------------------------------------
 // Sizing the default workload for a 2GB container (comprehensive calculation)
@@ -108,6 +117,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <numeric>
 #include <random>
 #include <string>
 #include <thread>
@@ -132,6 +142,7 @@ struct BenchConfig {
     std::string data_dir = "./bench_data";
     size_t writes = kDefaultWrites;
     size_t reads = kDefaultReads;
+    size_t deletes = 0; // opt-in: 0 means the delete phase is skipped entirely
     size_t min_value_size = kDefaultMinValueSize;
     size_t max_value_size = kDefaultMaxValueSize;
     double miss_rate = kDefaultMissRate;
@@ -148,6 +159,14 @@ void print_usage() {
               << kDefaultWrites << ")\n"
         "  --reads=N               number of Get operations to time (default "
               << kDefaultReads << ")\n"
+        "  --deletes=N             number of distinct, previously-written keys to delete\n"
+        "                          between the write and read phases, sampled without\n"
+        "                          replacement (default 0, i.e. the delete phase is skipped\n"
+        "                          entirely). Deleted keys naturally show up as misses in the\n"
+        "                          read phase if randomly selected as a \"hit\" target -- that's\n"
+        "                          correct behavior (the key really is gone), not a bug, so\n"
+        "                          the observed hit rate will read a bit below --miss-rate's\n"
+        "                          complement once --deletes is nonzero.\n"
         "  --min-value-size=N      lower bound, in bytes, of each written value (default "
               << kDefaultMinValueSize << ")\n"
         "  --max-value-size=N      upper bound, in bytes, of each written value (default "
@@ -199,6 +218,8 @@ BenchConfig parse_args(int argc, char** argv) {
             cfg.writes = std::stoull(val);
         } else if (parse_flag(arg, "reads", val)) {
             cfg.reads = std::stoull(val);
+        } else if (parse_flag(arg, "deletes", val)) {
+            cfg.deletes = std::stoull(val);
         } else if (parse_flag(arg, "min-value-size", val)) {
             cfg.min_value_size = std::stoull(val);
         } else if (parse_flag(arg, "max-value-size", val)) {
@@ -229,6 +250,7 @@ BenchConfig parse_args(int argc, char** argv) {
         std::cerr << "--max-value-size must be >= --min-value-size\n";
         std::exit(1);
     }
+    if (cfg.deletes > cfg.writes) cfg.deletes = cfg.writes;
     return cfg;
 }
 
@@ -298,6 +320,44 @@ WriteResult run_write_phase(StorageEngine& engine, const BenchConfig& cfg) {
     return r;
 }
 
+struct DeleteResult {
+    double seconds = 0.0;
+    size_t ops = 0;
+};
+
+// Deletes `cfg.deletes` distinct, previously-written keys, sampled without
+// replacement. Materializes the full [0, writes) index range once and
+// shuffles it rather than rejection-sampling for distinctness -- simpler
+// and robust, and the memory cost (writes * 8 bytes, ~24MB at 3,000,000
+// writes) is trivial next to the memtable/index cache.
+DeleteResult run_delete_phase(StorageEngine& engine, const BenchConfig& cfg) {
+    std::vector<size_t> indices(cfg.writes);
+    std::iota(indices.begin(), indices.end(), 0);
+    std::mt19937_64 plan_rng(7);
+    std::shuffle(indices.begin(), indices.end(), plan_rng);
+    indices.resize(cfg.deletes); // cfg.deletes already clamped to <= cfg.writes
+
+    auto ranges = split_range(indices.size(), cfg.threads);
+    std::vector<std::thread> workers;
+
+    auto t0 = std::chrono::steady_clock::now();
+    for (unsigned t = 0; t < cfg.threads; ++t) {
+        auto [lo, hi] = ranges[t];
+        workers.emplace_back([&engine, &indices, lo, hi] {
+            for (size_t i = lo; i < hi; ++i) {
+                engine.Delete(hit_key(indices[i]));
+            }
+        });
+    }
+    for (auto& w : workers) w.join();
+    auto t1 = std::chrono::steady_clock::now();
+
+    DeleteResult r;
+    r.seconds = std::chrono::duration<double>(t1 - t0).count();
+    r.ops = indices.size();
+    return r;
+}
+
 struct ReadResult {
     double seconds = 0.0;
     size_t observed_hits = 0;
@@ -361,6 +421,7 @@ int main(int argc, char** argv) {
 
     std::cout << "=== kv_benchmark ===\n"
               << "writes=" << cfg.writes
+              << " deletes=" << cfg.deletes
               << " reads=" << cfg.reads
               << " value_size=[" << cfg.min_value_size << "-" << cfg.max_value_size << "]B"
               << " miss_rate=" << cfg.miss_rate
@@ -369,6 +430,7 @@ int main(int argc, char** argv) {
               << " data_dir=" << cfg.data_dir << "\n\n";
 
     WriteResult wr;
+    DeleteResult dr;
     ReadResult rr;
     {
         // Scoped so the engine (and its open WAL file handle) is destroyed
@@ -376,9 +438,13 @@ int main(int argc, char** argv) {
         // delete a directory containing a file another handle still has open.
         StorageEngine engine(cfg.data_dir, cfg.memtable_threshold);
         wr = run_write_phase(engine, cfg);
+        if (cfg.deletes > 0) {
+            dr = run_delete_phase(engine, cfg);
+        }
         rr = run_read_phase(engine, cfg);
     }
     double wps = wr.seconds > 0.0 ? static_cast<double>(cfg.writes) / wr.seconds : 0.0;
+    double dps = dr.seconds > 0.0 ? static_cast<double>(dr.ops) / dr.seconds : 0.0;
     double rps = rr.seconds > 0.0 ? static_cast<double>(cfg.reads) / rr.seconds : 0.0;
     double observed_miss_rate = cfg.reads > 0
         ? static_cast<double>(rr.observed_misses) / static_cast<double>(cfg.reads)
@@ -393,6 +459,11 @@ int main(int argc, char** argv) {
     std::cout << "WPS=" << wps << "\n";
     std::cout << "TOTAL_VALUE_BYTES=" << wr.total_value_bytes << "\n";
     std::cout << "AVG_VALUE_BYTES=" << avg_value_bytes << "\n";
+    if (cfg.deletes > 0) {
+        std::cout << "DELETE_OPS=" << dr.ops << "\n";
+        std::cout << "DELETE_SECONDS=" << dr.seconds << "\n";
+        std::cout << "DPS=" << dps << "\n";
+    }
     std::cout << "READ_OPS=" << cfg.reads << "\n";
     std::cout << "READ_SECONDS=" << rr.seconds << "\n";
     std::cout << "RPS=" << rps << "\n";
