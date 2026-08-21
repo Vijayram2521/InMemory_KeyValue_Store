@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the kv_benchmark image and run it in a container capped at 2GB of
+# Build the kv_benchmark image and run it in a container capped at 4GB of
 # memory, reporting write/read throughput (WPS/RPS) with 15% guaranteed-miss
 # reads by default.
 #
@@ -10,7 +10,7 @@
 # are simply not passed through, so this script never hardcodes a number
 # that could drift out of sync with the binary's actual defaults.
 #
-# Optional env overrides: MEMORY_LIMIT (default 2g), WRITES, READS,
+# Optional env overrides: MEMORY_LIMIT (default 4g), WRITES, READS,
 #   MIN_VALUE_SIZE, MAX_VALUE_SIZE, MISS_RATE, THREADS, MEMTABLE_THRESHOLD
 #
 # Usage: ./scripts/run_benchmark_docker.sh
@@ -18,7 +18,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 IMAGE="lsm-kv-benchmark:latest"
-MEMORY_LIMIT="${MEMORY_LIMIT:-2g}"
+MEMORY_LIMIT="${MEMORY_LIMIT:-4g}"
 
 docker build -t "$IMAGE" .
 

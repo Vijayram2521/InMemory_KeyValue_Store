@@ -12,6 +12,15 @@
 // ---------------------------------------------------------------------------
 // Sizing the default workload for a 2GB container (comprehensive calculation)
 // ---------------------------------------------------------------------------
+// NOTE: the container's own --memory cap was later raised to 4GB (see
+// Dockerfile / scripts/run_benchmark_docker.*) for more headroom on the
+// verification VM. The workload's sizing math below still targets the
+// original 2GB reference budget deliberately -- it doesn't need to grow
+// just because the container got roomier, so treat every "~X% of 2GB"
+// figure below as "~half that, of the actual 4GB cap" if you want the
+// up-to-date percentage. The absolute numbers (writes, memtable-threshold,
+// value sizes) are unchanged.
+// ---------------------------------------------------------------------------
 // Every value is a uniformly random size in [kDefaultMinValueSize,
 // kDefaultMaxValueSize] -- deliberately wide (16x) so no single record size
 // dominates the dataset ("no monotonicity": a fixed --value-size would make

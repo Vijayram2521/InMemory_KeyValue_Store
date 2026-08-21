@@ -1,4 +1,4 @@
-# Build the kv_benchmark image and run it in a container capped at 2GB of
+# Build the kv_benchmark image and run it in a container capped at 4GB of
 # memory, reporting write/read throughput (WPS/RPS) with 15% guaranteed-miss
 # reads by default.
 #
@@ -9,7 +9,7 @@
 # are simply not passed through, so this script never hardcodes a number
 # that could drift out of sync with the binary's actual defaults.
 #
-# Optional env overrides: MEMORY_LIMIT (default 2g), WRITES, READS,
+# Optional env overrides: MEMORY_LIMIT (default 4g), WRITES, READS,
 #   MIN_VALUE_SIZE, MAX_VALUE_SIZE, MISS_RATE, THREADS, MEMTABLE_THRESHOLD
 #
 # Usage: .\scripts\run_benchmark_docker.ps1
@@ -17,7 +17,7 @@ $ErrorActionPreference = "Stop"
 Set-Location (Join-Path $PSScriptRoot "..")
 
 $Image = "lsm-kv-benchmark:latest"
-$MemoryLimit = if ($env:MEMORY_LIMIT) { $env:MEMORY_LIMIT } else { "2g" }
+$MemoryLimit = if ($env:MEMORY_LIMIT) { $env:MEMORY_LIMIT } else { "4g" }
 
 docker build -t $Image .
 

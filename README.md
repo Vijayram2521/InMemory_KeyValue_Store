@@ -14,7 +14,7 @@ We have successfully transitioned from a volatile in-memory store to a durable e
     * **Indexed Point Lookups:** Every SSTable carries a full sorted index (`Key -> Byte Offset`) plus a fixed footer; a lookup binary-searches the index in memory, then does one `seekg` straight to the record. No SSTable is ever linearly scanned to answer a `Get`.
 * **Thread-Safety:** Utilizes `std::shared_mutex` for a "Single Writer, Multiple Reader" concurrency model.
 * **Test Suite:** Real assertions (not print-and-eyeball output) via a small header-only framework, wired into CTest. 31 checks covering WAL crash recovery, SSTable flush/restart, tombstone resurrection, Manifest, StorageEngine edge cases (overwrite, delete-then-revive), and the SSTable index/binary-search path directly.
-* **Throughput Benchmark:** `kv_benchmark` times writes and reads separately against a workload sized deliberately against a 2GB memory budget (see "Benchmarking" below), with every value an independently random size and 15% of reads guaranteed misses -- runnable natively or in a Docker container capped at `--memory=2g`.
+* **Throughput Benchmark:** `kv_benchmark` times writes and reads separately against a workload sized deliberately against a 2GB memory budget (see "Benchmarking" below), with every value an independently random size and 15% of reads guaranteed misses -- runnable natively or in a Docker container capped at `--memory=4g`.
 
 ---
 
@@ -201,13 +201,13 @@ is printed alongside the requested one so you can confirm the split landed
 correctly.
 
 ```bash
-# Build the image and run it in a container capped at 2GB of memory
+# Build the image and run it in a container capped at 4GB of memory
 ./scripts/run_benchmark_docker.sh    # bash
 ./scripts/run_benchmark_docker.ps1   # PowerShell
 ```
 Optional env overrides: `WRITES`, `READS`, `MIN_VALUE_SIZE`,
 `MAX_VALUE_SIZE`, `MISS_RATE`, `THREADS`, `MEMTABLE_THRESHOLD`,
-`MEMORY_LIMIT` (default `2g`). Leave any of them unset and the container
+`MEMORY_LIMIT` (default `4g`). Leave any of them unset and the container
 falls back to `kv_benchmark`'s own compiled-in defaults (1,000,000 writes,
 5,000 reads, memtable-threshold 250,000, value sizes 64-1024 bytes) -- the
 Dockerfile and scripts deliberately don't re-hardcode those numbers, so
@@ -218,12 +218,15 @@ list.
 **How the default 1,000,000-write workload was sized:** at an average
 on-disk record size of ~563 bytes (9 bytes of framing + ~10-byte key +
 average 544-byte value), 1,000,000 writes lands at ~563MB of SSTable data on
-disk -- about a quarter of the container's 2GB budget, verified empirically
-(4 SSTables totaling 562.9MB, within 0.4% of the calculation). The
-`memtable-threshold` of 250,000 keeps the in-flight memtable's peak RAM
-around ~150MB (~7% of the budget); the index cache (see Phase 4 below) adds
-another ~40MB across all 1,000,000 indexed keys. Both comfortably inside the
-2GB limit.
+disk -- about a quarter of the *original* 2GB reference budget the workload
+was sized against, verified empirically (4 SSTables totaling 562.9MB, within
+0.4% of the calculation). The `memtable-threshold` of 250,000 keeps the
+in-flight memtable's peak RAM around ~150MB (~7% of that 2GB reference); the
+index cache (see Phase 4 below) adds another ~40MB across all 1,000,000
+indexed keys. The container itself now runs with a `--memory=4g` cap (up
+from the original 2g) for extra headroom, so in practice this workload uses
+under 15% of what the container actually allows -- the workload wasn't
+rescaled to fill the larger cap, it just has more room to spare.
 
 **Read performance:** every SSTable lookup binary-searches that file's
 cached index (built once, not per lookup) and does a single `seekg` -- no

@@ -1,5 +1,5 @@
 # Builds kv_benchmark and runs it in a small runtime image.
-# Intended usage: `docker run --memory=2g --memory-swap=2g <image> [kv_benchmark args]`
+# Intended usage: `docker run --memory=4g --memory-swap=4g <image> [kv_benchmark args]`
 # to measure write/read throughput under a fixed memory budget.
 
 # ---- Build stage ----
