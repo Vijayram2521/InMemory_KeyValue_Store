@@ -2,8 +2,8 @@
 
 A high-performance, persistent Key-Value storage engine built from scratch in C++. This project implements a **Log-Structured Merge-Tree (LSM-Tree)** architecture, modeled after industry standards like RocksDB and AlloyDB, optimized for high write throughput and durable storage.
 
-## 📊 Project Status: Phase 4 Complete (Indexed Search) + Distributed Cluster (single-shard perf validated)
-We have successfully transitioned from a volatile in-memory store to a durable engine capable of surviving crashes, managing on-disk sorted files, and finding a key in any of them without scanning the file. On top of that, a distributed leader + compute-node architecture now exists and is perf-validated end to end -- see "Distributed Architecture" below.
+## 📊 Project Status: Phase 4 Complete (Indexed Search) + Distributed Cluster (implemented, correctness-verified; perf comparison against the real baseline still pending)
+We have successfully transitioned from a volatile in-memory store to a durable engine capable of surviving crashes, managing on-disk sorted files, and finding a key in any of them without scanning the file. On top of that, a distributed leader + compute-node architecture now exists, is fully implemented, and is verified correct end to end (real `docker compose` deployment, real cross-node routing) -- but has **not yet been perf-compared against the only single-node number that means anything (the "biggest" stress benchmark)**. See "Distributed Architecture" below for exactly what is and isn't validated.
 
 ### Completed Features
 * **Durable Write-Ahead Log (WAL):** Every operation is logged to an append-only binary file with sequence numbers before touching RAM, ensuring zero data loss on crashes.
@@ -208,23 +208,41 @@ all, it sits entirely on top of it.
 * **Real `docker compose up` deployment**, not just a build that compiles: 4 containers (1 leader + 3 compute, each `mem_limit: 1.2g`), verified healthy and staying up (not crash-looping). A standalone smoke-test client -- a separate process, not part of the test suite, built and run on the VM against the actually-running leader on its published port -- drove real PUT/GET/DELETE over the real Docker network. Cross-node routing was confirmed at the deployment level too: `docker compose exec <node> ls -la /data` showed different keys landing in different compute nodes' data directories.
 * **Four real bugs found and fixed during this**, each with actual evidence rather than assumed away: the FNV-1a clustering issue above; `ComputeNodeServer::stop()` hanging indefinitely because closing a listening socket from another thread doesn't reliably unblock a thread already parked in `accept()` (confirmed hung for real via `timeout 15`, fixed with `poll()`-based polling instead of a blocking `accept()` call); compute nodes crashing on startup in the real deployment (`Failed to open WAL file`) because a fresh Docker named volume is root-owned by default while the container runs as a non-root user (fixed the standard way -- bake the data directory into the image with correct ownership before the volume ever mounts there, so Docker's volume copy-up carries it over); and `compute_node` silently using `StorageEngine`'s tiny unit-test-sized default `memtable_threshold` (5) instead of a real operational one, which would have produced hundreds of thousands of SSTable generations per shard at benchmark scale -- caught by inspection before running the real benchmark, not after getting a misleading number.
 
-### Perf: distributed cluster vs. single node, same workload
-`cluster_benchmark` (new: drives PUT/GET through a real `leader_node` over TCP, since `kv_benchmark` only ever talks to an in-process `StorageEngine`) was run against the live deployed cluster with the exact same workload as the single-node "large" benchmark above (1,000,000 writes, 10,000,000 reads, 4 threads, default 64-1024B values) for a direct, apples-to-apples comparison:
+### Perf: what's measured so far, and what the real comparison actually is
+**The only single-node number worth comparing against is the "biggest" benchmark's** (33
+generations, ~18GB, 3,000,000 keys): **~11,480-11,494 WPS, ~4,412-4,419 RPS**. That run is the one
+that actually stressed the engine -- large enough that per-node data no longer fit comfortably in
+page cache, which is the exact problem this whole distributed architecture exists to fix (see the
+Bloom filter finding above). The "large" benchmark's ~89,470 WPS / ~351,649 RPS, by contrast, is
+**not a meaningful baseline for anything** -- it's a 1,000,000-key dataset sitting in only 4
+SSTable generations, comfortably cached, measuring how fast the engine is when it has no real
+problem to solve. Comparing a distributed run against that number tells you nothing about whether
+sharding helps; it only tells you sharding adds overhead when there was nothing to fix in the
+first place, which is true but not the interesting question.
 
-| Metric | Single-node (in-process) | Distributed (leader + 3 compute nodes) | Ratio |
-|---|---|---|---|
-| WPS | ~89,470 | 22,663.7 | ~3.95x slower |
-| RPS | ~351,649 | 21,521.1 | ~16.34x slower |
-| Avg. write latency (4 threads) | ~44.7us | ~176.5us | +~131.8us |
-| Avg. read latency (4 threads) | ~11.4us | ~185.9us | +~174.5us |
+So far, `cluster_benchmark` (new: drives PUT/GET through a real `leader_node` over TCP, since
+`kv_benchmark` only ever talks to an in-process `StorageEngine`) has only been run at that same
+easy, 1,000,000-key/4-generations-per-node scale against the live deployed cluster -- **not yet at
+the 3,000,000-key scale that would be comparable to the real "biggest" baseline above.** For the
+record, at that easy scale: 22,663.7 WPS, 21,521.1 RPS, ~176.5us/write and ~185.9us/read average
+latency (4 threads; latency = threads / throughput, not 1 / throughput, since both benchmarks run
+4 concurrent threads). That's a real, correctly-measured number, but treat it only as "the cluster
+works and here's roughly what two Docker-bridge-network hops (client&rarr;leader,
+leader&rarr;compute-node) cost when there's nothing else going on" -- **not** as a verdict on
+whether sharding is worth it, which requires the comparison below instead.
 
-(Latency = threads / throughput, not 1 / throughput -- both benchmarks run 4 concurrent threads, so this accounts for that rather than mixing a per-thread number against an aggregate one.)
+**The comparison that actually tests the sharding hypothesis, not yet run:** the same
+3,000,000-key total keyspace used in the "biggest" single-node benchmark, sharded ~1,000,000 keys
+across each of the 3 compute nodes (matching the scale just measured above, so each node's own
+per-shard performance is a known quantity), compared directly against that benchmark's ~4,412 RPS.
+If per-node performance at ~1M keys holds up close to what was measured here, sharding wins
+outright even after the network tax; if it doesn't, that's real information too. Either way, this
+is the next benchmarking step for this project, not a hypothetical.
 
-**The distributed cluster is slower here, and that's expected, not a bug** -- at this dataset size (1,000,000 keys, well within what a single node handles comfortably, as the numbers above show) sharding has no problem to solve yet, so all it adds is network overhead with no compensating benefit. Each client operation costs two sequential network round trips, not one: client&rarr;leader, then leader&rarr;compute-node, both synchronous within the same request (`cluster_benchmark` doesn't pipeline requests, matching how a real client driving one op at a time would behave). ~130-175us of *added* latency per op (on top of the single-node engine's own already-real cost) for two Docker-bridge-network hops plus wire-protocol encode/decode is a plausible, not alarming, cost -- it's what you pay to turn an in-process function call into two network hops.
-
-**The real test of the sharding hypothesis isn't this comparison -- it's the same total keyspace, sharded, at the scale where a single node struggled.** The "biggest" single-node benchmark (33 generations, ~18GB, 3,000,000 keys) measured ~4,412 RPS specifically because per-node data volume had outgrown what fits comfortably in page cache. Sharding that same 3,000,000 keys across 3 nodes (~1,000,000 each, close to what was just benchmarked here) should let each node stay in the regime where it performs well, potentially outweighing the ~176-186us network tax measured above. That comparison -- distributed-at-the-scale-where-a-single-node-struggles vs. single-node-struggling -- is the one that actually tests whether this architecture solves the problem it was built for, and is the natural next benchmarking step, not yet run.
-
-Reproduce: `docker compose up --build -d`, then `./build/cluster_benchmark --leader-port=6000 --writes=1000000 --reads=10000000` (or point `--leader-host`/`--leader-port` at a remote deployment).
+Reproduce what's been measured so far: `docker compose up --build -d`, then
+`./build/cluster_benchmark --leader-port=6000 --writes=1000000 --reads=10000000` (or point
+`--leader-host`/`--leader-port` at a remote deployment). The at-scale comparison above hasn't been
+scripted as a preset yet.
 
 ---
 
@@ -244,10 +262,10 @@ Reproduce: `docker compose up --build -d`, then `./build/cluster_benchmark --lea
 * [ ] **Value Compression:** Compress each value (LZ4 is the natural choice -- fast enough that decompression cost on the read path stays negligible next to the I/O costs above, unlike heavier schemes optimized for ratio over speed) before writing it into an SSTable record, decompressing on read. Per-value rather than per-block: it fits this project's existing record framing (type + kLen + key + vLen + value) without restructuring the file format, at the cost of losing the better compression ratio a shared block-level dictionary would give across many small values. Matters most for the "large values" benchmark configuration (512-4096B, see below) -- that's exactly the value-size range where compression has real bytes to work with, unlike the earlier 64-1024B default where per-value overhead would dominate any savings.
 * [ ] **Snapshots:** Implement point-in-time consistent views of the database.
 
-### Phase 7: Distributed Architecture -- ✅ Implementation & single-shard perf validated
+### Phase 7: Distributed Architecture -- ✅ Implemented & correctness-verified; perf comparison against the real baseline still open
 * [x] **Leader + compute-node sharding:** see "Distributed Architecture" above for the full design, verification, and benchmark writeup. Consistent-hash routing, hand-rolled binary wire protocol, real `docker compose` deployment (4 containers, 1.2GB each), 43 new automated checks, 4 real bugs found and fixed with evidence.
-* [x] **Perf validated at the single-shard-comparable scale** (1M writes/10M reads, same as the single-node "large" benchmark): distributed is ~4-16x slower here, as expected -- see the writeup above for why (two network hops per op, no problem yet for sharding to solve at this data volume).
-* [ ] **Perf validated at the scale sharding is actually for:** re-run at the "biggest" single-node benchmark's scale (3,000,000 keys, sharded ~1M/node) and compare against that benchmark's ~4,412 RPS -- the comparison that actually tests whether this architecture solves the problem it was built for. Not yet run.
+* [x] **Network-overhead sanity check run** (1M writes/10M reads against the live deployment): 22,663.7 WPS / 21,521.1 RPS, ~176.5us/~185.9us average write/read latency. Useful for knowing roughly what two network hops cost -- **not** a verdict on whether sharding is worth it, since a single node has no real problem to solve at this easy, cache-friendly scale either.
+* [ ] **The comparison that actually answers whether sharding helps:** shard the same 3,000,000-key total keyspace the "biggest" single-node benchmark used (~1M/node, comparable to the scale just sanity-checked above) and compare against that benchmark's real, stressed-scale numbers (~11,480-11,494 WPS, ~4,412-4,419 RPS -- the only single-node figures that reflect genuine I/O pressure, not the "large" benchmark's cached-and-easy ~89,470/~351,649). Not yet run.
 * [ ] **Resize workflow:** dynamic add/remove of compute nodes with data rebalancing. `HashRing` was deliberately kept minimal (fixed membership, no virtual nodes) specifically so this phase can extend it rather than rewrite it.
 * [ ] **Virtual nodes:** needed for real load balance across a small number of physical nodes -- deferred alongside resize since they're most useful once membership can actually change.
 * [ ] **Failover:** detect and route around an unreachable compute node instead of just failing the request loud (current behavior).
