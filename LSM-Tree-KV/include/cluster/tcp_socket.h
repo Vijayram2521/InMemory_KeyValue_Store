@@ -41,6 +41,16 @@ public:
     // (valid() == false) on error.
     TcpSocket accept();
 
+    // Waits up to timeout_ms for the socket to become readable (for a
+    // listening socket: a connection is pending) or writable-would-succeed.
+    // Returns false on timeout or error. Used instead of calling accept()
+    // directly so an accept loop can periodically re-check a shutdown flag
+    // rather than blocking indefinitely -- closing a socket from another
+    // thread does NOT reliably unblock a thread already parked in a
+    // blocking accept() call (confirmed the hard way: it hung indefinitely
+    // on Linux/ARM64 here, not just theoretical POSIX-portability caution).
+    bool wait_readable(int timeout_ms) const;
+
     // The actual bound port -- only meaningful after listen() succeeds;
     // resolves what port 0 (ephemeral) actually got assigned.
     uint16_t bound_port() const;

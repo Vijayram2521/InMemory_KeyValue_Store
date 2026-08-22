@@ -53,14 +53,25 @@ uint16_t ComputeNodeServer::port() const { return listen_socket_.bound_port(); }
 
 void ComputeNodeServer::stop() {
     if (!running_.exchange(false)) return; // already stopped
-    listen_socket_.close(); // unblocks the accept() call in accept_loop
+    // Join BEFORE closing: accept_loop now exits on its own within ~200ms
+    // once running_ is false (via the poll timeout in wait_readable), so
+    // there's no need for close() to interrupt anything -- and closing
+    // first would race the accept-loop thread's concurrent access to the
+    // same TcpSocket's underlying fd.
     if (accept_thread_.joinable()) accept_thread_.join();
+    listen_socket_.close();
 }
 
 void ComputeNodeServer::accept_loop() {
     while (running_) {
+        // Poll with a bounded timeout rather than blocking in accept()
+        // directly, so this loop re-checks running_ regularly instead of
+        // potentially blocking forever -- closing listen_socket_ from
+        // stop() is not a reliable way to unblock a thread already parked
+        // in accept() (confirmed: it hung indefinitely on Linux/ARM64).
+        if (!listen_socket_.wait_readable(200)) continue; // timed out, loop back to recheck running_
         TcpSocket client = listen_socket_.accept();
-        if (!client.valid()) break; // listen socket closed (stop() was called) or a real error
+        if (!client.valid()) continue; // spurious/racy failure (e.g. stop() closed it between poll and accept)
         std::thread(handle_connection, std::ref(engine_), std::move(client)).detach();
     }
 }

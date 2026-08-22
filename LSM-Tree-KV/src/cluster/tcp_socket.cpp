@@ -4,6 +4,7 @@
 #include <cstring>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -87,6 +88,15 @@ TcpSocket TcpSocket::accept() {
     int client_fd = ::accept(fd_, nullptr, nullptr);
     if (client_fd < 0) return TcpSocket(-1);
     return TcpSocket(client_fd);
+}
+
+bool TcpSocket::wait_readable(int timeout_ms) const {
+    struct pollfd pfd{};
+    pfd.fd = fd_;
+    pfd.events = POLLIN;
+    int result = poll(&pfd, 1, timeout_ms);
+    if (result <= 0) return false; // timeout (0) or error (-1)
+    return (pfd.revents & POLLIN) != 0;
 }
 
 uint16_t TcpSocket::bound_port() const {
