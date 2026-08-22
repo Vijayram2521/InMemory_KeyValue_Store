@@ -76,9 +76,14 @@ add_library(
     src/cluster/hash_ring.cpp
     src/cluster/wire_protocol.cpp
     src/cluster/tcp_socket.cpp
+    src/cluster/compute_node_server.cpp
 )
 target_link_libraries(kv_cluster kv_engine Threads::Threads)
 
-add_executable(kv_cluster_tests src/cluster_test_main.cpp tests/test_hash_ring.cpp tests/test_wire_protocol.cpp)
+add_executable(compute_node src/compute_node_main.cpp)
+target_link_libraries(compute_node kv_cluster kv_engine Threads::Threads)
+
+add_executable(kv_cluster_tests src/cluster_test_main.cpp tests/test_hash_ring.cpp
+                                 tests/test_wire_protocol.cpp tests/test_cluster_integration.cpp)
 target_link_libraries(kv_cluster_tests kv_cluster kv_engine)
 add_test(NAME kv_cluster_tests COMMAND kv_cluster_tests WORKING_DIRECTORY ${CMAKE_BINARY_DIR})

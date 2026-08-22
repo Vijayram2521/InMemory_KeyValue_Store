@@ -14,6 +14,9 @@ int main() {
         kv_tests::run_test_wire_protocol();
         std::cout << std::endl;
 
+        kv_tests::run_test_cluster_integration();
+        std::cout << std::endl;
+
         const auto& s = kv_tests::stats();
         std::cout << "===================================" << std::endl;
         std::cout << "Cluster test results: " << s.passed << " passed, " << s.failed << " failed" << std::endl;
