@@ -13,7 +13,8 @@ We have successfully transitioned from a volatile in-memory store to a durable e
 * **Multi-Layered Search:** * **First-Hit Logic:** Search order flows from `MemTable` → `Tombstone Set` → `SSTables` (Newest to Oldest).
     * **Indexed Point Lookups:** Every SSTable carries a full sorted index (`Key -> Byte Offset`) plus a fixed footer; a lookup binary-searches the index in memory, then does one `seekg` straight to the record. No SSTable is ever linearly scanned to answer a `Get`.
 * **Thread-Safety:** Utilizes `std::shared_mutex` for a "Single Writer, Multiple Reader" concurrency model.
-* **Test Suite:** Real assertions (not print-and-eyeball output) via a small header-only framework, wired into CTest. 31 checks covering WAL crash recovery, SSTable flush/restart, tombstone resurrection, Manifest, StorageEngine edge cases (overwrite, delete-then-revive), and the SSTable index/binary-search path directly.
+* **Bloom Filters:** One filter per SSTable, checked before opening the file at all. See Phase 5 in the Roadmap below for the full writeup (hashing scheme, sizing, measured false-positive rate).
+* **Test Suite:** Real assertions (not print-and-eyeball output) via a small header-only framework, wired into CTest. 36 checks covering WAL crash recovery, SSTable flush/restart, tombstone resurrection, Manifest, StorageEngine edge cases (overwrite, delete-then-revive), the SSTable index/binary-search path, and the Bloom filter's no-false-negatives guarantee plus measured false-positive rate.
 * **Throughput Benchmark:** `kv_benchmark` times writes and reads separately against a workload sized deliberately against a 2GB memory budget (see "Benchmarking" below), with every value an independently random size and 15% of reads guaranteed misses -- runnable natively or in a Docker container capped at `--memory=4g`.
 
 ---
@@ -28,6 +29,7 @@ The engine utilizes a layered approach to balance speed and durability:
 4.  **SSTables:** Immutable, sorted binary files on disk representing snapshots of history. Each file is `[data block][index block][footer]`; puts and tombstones are merged into one ascending-key sequence during the flush so the index (and binary search over it) stays valid regardless of record type.
 5.  **Manifest:** The "Source of Truth" that manages the list of active SSTables and current sequence numbers.
 6.  **Index Cache:** An in-memory `unordered_map<sstable path, index>` inside `StorageEngine`, populated once per file (at flush time for new generations, at startup for generations recovered via the Manifest) and never rebuilt on the read path.
+7.  **Bloom Filter Cache:** A parallel `unordered_map<sstable path, BloomFilter>`, same population lifecycle as the Index Cache above. Consulted in `Get` *before* the index/file at all -- a "definitely not here" answer skips that SSTable without ever opening it.
 
 ### Write Path
 ```
@@ -113,6 +115,12 @@ The engine utilizes a layered approach to balance speed and durability:
  +-----------------------------+
                  |
                  v   for each generation, newest first:
+     +----------------------+
+     |     Bloom Filter     |   definitely absent --> skip this file, no open()
+     | maybe_contains(key)? |
+     +----------------------+
+                 | maybe present
+                 v
       +--------------------+
       |    Index Cache     |
       | binary_search(key) |
@@ -160,7 +168,7 @@ Lookup: seek to EOF-20, read footer --> binary_search(index) in memory
 * [x] **Point Lookups:** `SSTable::search_with_index` binary-searches the cached index and does exactly one `seekg` + read on a hit; there is no scan fallback. Measured on the benchmark's default 1,000,000-write / 4-generation workload: read throughput went from ~1.75 RPS (full linear scan per lookup) to **~150-340 RPS on Windows** (native x86_64) and **~190K-363K RPS on Linux** (Docker container, ARM64, warm page cache) -- see the "Benchmarking" section below for the full numbers, environment differences, and how each was measured, and `src/benchmark.cpp`'s sizing comment for the before/after methodology.
 
 ### Phase 5: Optimization & Efficiency
-* [ ] **Bloom Filters:** One bitmask per SSTable, built at flush/load time alongside the existing index, so a `Get` can check "definitely not here" *before* paying for `std::ifstream::open()` -- currently the dominant per-lookup cost (see "Benchmarking" above). This matters most for the guaranteed-miss path and for stores with many generations: at the default 4-generation scale a miss opens 4 files; at 30+ generations (see the "Large-scale, higher-generation-count results" benchmark below) it opens all 30+, and a bloom filter is what lets it skip that entirely for files that provably don't have the key. Standard tradeoff to size for: false-positive rate vs. bits-per-key (e.g. ~1% FPR at ~10 bits/key) -- worth sizing against this project's own measured key counts (1M-3M in the benchmarks so far) rather than a generic default.
+* [x] **Bloom Filters:** One filter per SSTable (`include/engine/bloom_filter.h`, `src/bloom_filter.cpp`), built at flush/load time alongside the existing index and consulted in `Get` *before* `std::ifstream::open()` -- currently the dominant per-lookup cost (see "Benchmarking" above) -- so a `Get` can skip opening a file entirely when the filter proves the key definitely isn't in it. 5 hash probes per key (Kirsch-Mitzenmacher double-hashing: two FNV-1a hashes combined as `h1 + i*h2 mod m`, standard practice in production Bloom filters -- provably as effective as 5 genuinely independent hash functions without paying for 5 separate hash computations), 10 bits/key, landing at the standard ~1% false-positive-rate ballpark (~0.94% analytically; **0.60% measured** on a 100,000-key sample -- see `tests/test_bloom_filter.cpp`). Correctness-checked two ways: 5 dedicated unit tests (no false negatives -- a hard guarantee, checked exactly, not sampled; false-positive rate stays well under a generous bound; sizing) plus the full existing suite (36/36 checks) passing unmodified through the public `StorageEngine` API, confirming this is purely a skip-work optimization with no observable behavior change. Perf validation (does it actually move the RPS needle, especially on the many-generation "biggest" workload) is the next step, pending VM access.
 * [ ] **Compaction (L0 -> L1):** A background (or on-demand) worker that merges multiple SSTable generations into fewer, larger ones -- discarding obsolete versions of overwritten keys and dropping tombstones once nothing older they'd shadow remains. Two things to get right: (1) **locking** -- compaction mutates the same `sstable_files` list and `index_cache` that `Get` reads under `shared_lock`, so a merge needs to build the new merged file(s) *off to the side* first and only take the `unique_lock` for the brief pointer-swap that atomically replaces the old generation list with the new one, rather than holding a write lock for the whole (potentially slow) merge; (2) it directly fixes two things this session's benchmarking exposed as real, not theoretical, problems: generation count growing unboundedly (currently the only way to keep it bounded is choosing a big `memtable-threshold` up front) and stale WAL segments never being cleaned up after their generation flushes (roughly doubles on-disk footprint today -- see the sizing math in `src/benchmark.cpp`).
 * [ ] **Cold-cache benchmarking:** The Linux/Docker RPS numbers in the "Benchmarking" section above all reflect a warm OS page cache (reads immediately follow the write phase that produced the same dataset). Get a genuine cold-cache number too -- e.g. drop caches between phases, or read data written by a prior, separate `docker run` -- for a fuller "worst case" picture alongside the current "best case" numbers.
 

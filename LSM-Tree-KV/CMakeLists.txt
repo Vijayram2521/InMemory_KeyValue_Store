@@ -25,6 +25,7 @@ add_library(
     src/wal.cpp
     src/manifest.cpp
     src/sstable.cpp
+    src/bloom_filter.cpp
 )
 target_link_libraries(kv_engine Threads::Threads)
 
@@ -35,6 +36,7 @@ set(TEST_SOURCES
     tests/test_wal.cpp
     tests/test_sstable.cpp
     tests/test_sstable_index.cpp
+    tests/test_bloom_filter.cpp
     tests/test_tombstone.cpp
     tests/test_manifest.cpp
     tests/test_storage_engine.cpp
