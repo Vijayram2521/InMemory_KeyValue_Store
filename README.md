@@ -168,7 +168,7 @@ Lookup: seek to EOF-20, read footer --> binary_search(index) in memory
 * [x] **Point Lookups:** `SSTable::search_with_index` binary-searches the cached index and does exactly one `seekg` + read on a hit; there is no scan fallback. Measured on the benchmark's default 1,000,000-write / 4-generation workload: read throughput went from ~1.75 RPS (full linear scan per lookup) to **~150-340 RPS on Windows** (native x86_64) and **~190K-363K RPS on Linux** (Docker container, ARM64, warm page cache) -- see the "Benchmarking" section below for the full numbers, environment differences, and how each was measured, and `src/benchmark.cpp`'s sizing comment for the before/after methodology.
 
 ### Phase 5: Optimization & Efficiency
-* [x] **Bloom Filters:** One filter per SSTable (`include/engine/bloom_filter.h`, `src/bloom_filter.cpp`), built at flush/load time alongside the existing index and consulted in `Get` *before* `std::ifstream::open()` -- currently the dominant per-lookup cost (see "Benchmarking" above) -- so a `Get` can skip opening a file entirely when the filter proves the key definitely isn't in it. 5 hash probes per key (Kirsch-Mitzenmacher double-hashing: two FNV-1a hashes combined as `h1 + i*h2 mod m`, standard practice in production Bloom filters -- provably as effective as 5 genuinely independent hash functions without paying for 5 separate hash computations), 10 bits/key, landing at the standard ~1% false-positive-rate ballpark (~0.94% analytically; **0.60% measured** on a 100,000-key sample -- see `tests/test_bloom_filter.cpp`). Correctness-checked two ways: 5 dedicated unit tests (no false negatives -- a hard guarantee, checked exactly, not sampled; false-positive rate stays well under a generous bound; sizing) plus the full existing suite (36/36 checks) passing unmodified through the public `StorageEngine` API, confirming this is purely a skip-work optimization with no observable behavior change. Perf validation (does it actually move the RPS needle, especially on the many-generation "biggest" workload) is the next step, pending VM access.
+* [x] **Bloom Filters:** One filter per SSTable (`include/engine/bloom_filter.h`, `src/bloom_filter.cpp`), built at flush/load time alongside the existing index and consulted in `Get` before `std::ifstream::open()`, so a `Get` can skip opening a file entirely when the filter proves the key definitely isn't in it. 5 hash probes per key (Kirsch-Mitzenmacher double-hashing: two FNV-1a hashes combined as `h1 + i*h2 mod m`, standard practice in production Bloom filters -- provably as effective as 5 genuinely independent hash functions without paying for 5 separate hash computations), 10 bits/key, landing at the standard ~1% false-positive-rate ballpark (~0.94% analytically; **0.60% measured** on a 100,000-key sample -- see `tests/test_bloom_filter.cpp`). Correctness-checked two ways: 5 dedicated unit tests (no false negatives -- a hard guarantee, checked exactly, not sampled; false-positive rate stays well under a generous bound; sizing) plus the full existing suite (36/36 checks) passing unmodified through the public `StorageEngine` API. **Perf-validated at scale, and the result is a genuinely useful negative one:** re-running the 33-generation "biggest" benchmark identically showed RPS/WPS essentially unchanged (~4,412 vs ~4,419 RPS, well within noise) -- see the "Bloom filter re-run" writeup in the Benchmarking section below for the full numbers and why. It disproves this project's original (inferred, never directly measured) assumption that `open()` call count was the dominant per-lookup cost at scale; the real cost is disk I/O for the reads that remain necessary, which a Bloom filter can reduce the *count* of but not the *volume* of. Kept in the codebase because it's still theoretically correct and cheap (and would matter more at smaller scale, or with a colder file-open path than this Linux/Docker environment has), but it's not what actually moves the needle here -- that's the evidence behind moving toward sharding across multiple nodes instead of further single-node read-path optimization.
 * [ ] **Compaction (L0 -> L1):** A background (or on-demand) worker that merges multiple SSTable generations into fewer, larger ones -- discarding obsolete versions of overwritten keys and dropping tombstones once nothing older they'd shadow remains. Two things to get right: (1) **locking** -- compaction mutates the same `sstable_files` list and `index_cache` that `Get` reads under `shared_lock`, so a merge needs to build the new merged file(s) *off to the side* first and only take the `unique_lock` for the brief pointer-swap that atomically replaces the old generation list with the new one, rather than holding a write lock for the whole (potentially slow) merge; (2) it directly fixes two things this session's benchmarking exposed as real, not theoretical, problems: generation count growing unboundedly (currently the only way to keep it bounded is choosing a big `memtable-threshold` up front) and stale WAL segments never being cleaned up after their generation flushes (roughly doubles on-disk footprint today -- see the sizing math in `src/benchmark.cpp`).
 * [ ] **Cold-cache benchmarking:** The Linux/Docker RPS numbers in the "Benchmarking" section above all reflect a warm OS page cache (reads immediately follow the write phase that produced the same dataset). Get a genuine cold-cache number too -- e.g. drop caches between phases, or read data written by a prior, separate `docker run` -- for a fuller "worst case" picture alongside the current "best case" numbers.
 
@@ -383,11 +383,42 @@ Reproduce with `./scripts/run_benchmark_docker_biggest.sh` (or `.ps1`).
 Budget real time for it -- unlike the other presets, the read phase alone
 takes tens of minutes at this generation count, not seconds.
 
-Either way, this is **up from ~1.75 RPS** before the index existed --
-roughly two to five orders of magnitude, depending on environment. The
-current bottleneck is one `std::ifstream` `open()` per SSTable a lookup has
-to touch (a guaranteed miss must open all of them), not scanning -- bloom
-filters (Phase 5 below) would let a miss skip that open entirely, which
-would matter more on Windows than it apparently does on Linux. Raise
-`WRITES` or `READS` deliberately, not by accident -- they still cost time,
-just far less than before.
+**Bloom filter re-run -- a negative result, and what it actually proves:**
+after implementing Bloom filters (Phase 5 below), this exact scenario was
+re-run identically (same 3,000,000 writes / 300,000 deletes / 10,000,000
+reads / 33 generations / values 512-4096B) to see whether skipping
+unnecessary `open()` calls would move the needle. It didn't, meaningfully:
+
+| Metric | Before Bloom filters | After Bloom filters | Delta |
+|---|---|---|---|
+| WPS | 11,479.9 | 11,494.5 | +0.13% (noise) |
+| Write latency | 87.10us | 86.998us | ~0 |
+| DPS | 149,930.5 | 181,539.8 | +21% (deletes don't touch the read path at all -- run-to-run system noise, not a Bloom filter effect) |
+| RPS | 4,419.1 | 4,412.24 | -0.16% (noise) |
+| Read latency | 226.29us | 226.642us | ~0 |
+| Block I/O (read) | ~95GB | ~89GB | ~6% less |
+
+The small I/O reduction shows the filter *is* doing its job (skipping some
+opens), but not enough to matter, which means the original hypothesis this
+project shipped Bloom filters to fix -- that `open()` call count was the
+dominant per-lookup cost -- was an *inference*, never directly measured, and
+turns out to be wrong at this scale. If it had been right, skipping ~93% of
+unnecessary generation touches (the Bloom filter's own unit-tested ~0.6%
+false-positive rate implies almost every non-matching generation gets
+correctly skipped) should have produced a large speedup, not a rounding
+error. The real cost is the disk I/O for the touches that remain
+*necessary* -- pulling actual record bytes from an ~18GB working set that
+doesn't comfortably fit in page cache, plausibly amplified by OS readahead
+pulling more than the ~2.3KB a single record needs. A Bloom filter can only
+eliminate *unnecessary* touches; it can't shrink the *necessary* data volume
+or make the disk faster. That's a real, useful negative result, not a
+wasted implementation -- it rules out one hypothesis with actual evidence
+and points at the right one, which is why this project's next direction is
+sharding the keyspace across multiple nodes rather than further
+single-node read-path micro-optimization (design in progress -- not yet a
+numbered roadmap phase below, pending alignment on the node topology).
+
+Either way, the index itself (see Phase 4 above) remains a **~2-5 order of
+magnitude** improvement over the pre-index ~1.75 RPS baseline this project
+started from. Raise `WRITES` or `READS` deliberately, not by accident --
+they still cost time, just far less than before the index existed.
