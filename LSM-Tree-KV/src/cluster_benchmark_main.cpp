@@ -6,10 +6,11 @@
 //
 // Methodology mirrors kv_benchmark.cpp deliberately: same hit_key/miss_key
 // disjoint-prefix scheme, same variable-value-size approach, same
-// build-the-op-plan-then-time-pure-Gets read phase, same
-// KEY=VALUE-per-line output -- so a side-by-side comparison against the
-// existing single-node numbers isn't comparing methodologically different
-// things.
+// build-the-op-plan-then-time-pure-Gets read phase, same delete-phase
+// sampling algorithm (same seed, same "shuffle then take the first N"
+// approach), same KEY=VALUE-per-line output -- so a side-by-side
+// comparison against the single-node numbers is comparing the same
+// workload shape, not a methodologically different one.
 #include "cluster/tcp_socket.h"
 #include "cluster/wire_protocol.h"
 
@@ -22,6 +23,7 @@
 #include <iomanip>
 #include <iostream>
 #include <mutex>
+#include <numeric>
 #include <random>
 #include <sstream>
 #include <string>
@@ -36,6 +38,7 @@ struct BenchConfig {
     std::string leader_host = "127.0.0.1";
     uint16_t leader_port = 6000;
     size_t writes = 1'000'000;
+    size_t deletes = 0; // opt-in: 0 skips the delete phase entirely, matching kv_benchmark
     size_t reads = 10'000'000;
     size_t min_value_size = 64;
     size_t max_value_size = 1024;
@@ -60,6 +63,7 @@ BenchConfig parse_args(int argc, char** argv) {
         if (parse_flag(arg, "leader-host", val)) cfg.leader_host = val;
         else if (parse_flag(arg, "leader-port", val)) cfg.leader_port = static_cast<uint16_t>(std::stoul(val));
         else if (parse_flag(arg, "writes", val)) cfg.writes = std::stoull(val);
+        else if (parse_flag(arg, "deletes", val)) cfg.deletes = std::stoull(val);
         else if (parse_flag(arg, "reads", val)) cfg.reads = std::stoull(val);
         else if (parse_flag(arg, "min-value-size", val)) cfg.min_value_size = std::stoull(val);
         else if (parse_flag(arg, "max-value-size", val)) cfg.max_value_size = std::stoull(val);
@@ -71,6 +75,8 @@ BenchConfig parse_args(int argc, char** argv) {
                          "  --leader-host=HOST      (default 127.0.0.1)\n"
                          "  --leader-port=N         (default 6000)\n"
                          "  --writes=N              (default 1000000)\n"
+                         "  --deletes=N             distinct previously-written keys to delete\n"
+                         "                          (default 0, phase skipped entirely)\n"
                          "  --reads=N               (default 10000000)\n"
                          "  --min-value-size=N / --max-value-size=N  (default 64/1024)\n"
                          "  --miss-rate=F           (default 0.15)\n"
@@ -80,6 +86,7 @@ BenchConfig parse_args(int argc, char** argv) {
         }
     }
     if (cfg.threads == 0) cfg.threads = 1;
+    if (cfg.deletes > cfg.writes) cfg.deletes = cfg.writes;
     return cfg;
 }
 
@@ -190,6 +197,49 @@ double run_write_phase(const BenchConfig& cfg) {
     return std::chrono::duration<double>(t1 - t0).count();
 }
 
+struct DeleteResult { double seconds = 0.0; size_t ops = 0; };
+
+// Mirrors kv_benchmark.cpp's run_delete_phase exactly: same sampling
+// algorithm (materialize [0,writes), shuffle with the same seed=7, take the
+// first `deletes`), so the two benchmarks delete the same *shape* of key
+// set relative to their own write phase, not just the same count.
+DeleteResult run_delete_phase(const BenchConfig& cfg) {
+    std::vector<size_t> indices(cfg.writes);
+    std::iota(indices.begin(), indices.end(), 0);
+    std::mt19937_64 plan_rng(7);
+    std::shuffle(indices.begin(), indices.end(), plan_rng);
+    indices.resize(cfg.deletes);
+
+    auto ranges = split_range(indices.size(), cfg.threads);
+    std::vector<std::thread> workers;
+    std::atomic<size_t> done{0};
+
+    auto t0 = std::chrono::steady_clock::now();
+    {
+        ProgressReporter progress("delete", done, indices.size(), cfg.progress_interval);
+        for (unsigned t = 0; t < cfg.threads; ++t) {
+            auto [lo, hi] = ranges[t];
+            workers.emplace_back([&cfg, &indices, &done, lo, hi] {
+                TcpSocket sock = connect_or_die(cfg);
+                size_t local_done = 0;
+                for (size_t i = lo; i < hi; ++i) {
+                    sock.send_all(encode_delete_request(hit_key(indices[i])));
+                    receive_message(sock); // discard; correctness proven by the integration tests
+                    if (++local_done % 1000 == 0) done += 1000;
+                }
+                done += local_done % 1000;
+            });
+        }
+        for (auto& w : workers) w.join();
+    }
+    auto t1 = std::chrono::steady_clock::now();
+
+    DeleteResult r;
+    r.seconds = std::chrono::duration<double>(t1 - t0).count();
+    r.ops = indices.size();
+    return r;
+}
+
 struct ReadResult { double seconds = 0.0; size_t hits = 0; size_t misses = 0; };
 
 ReadResult run_read_phase(const BenchConfig& cfg) {
@@ -247,12 +297,18 @@ int main(int argc, char** argv) {
 
     std::cout << "=== cluster_benchmark ===\n"
               << "leader=" << cfg.leader_host << ":" << cfg.leader_port
-              << " writes=" << cfg.writes << " reads=" << cfg.reads
+              << " writes=" << cfg.writes << " deletes=" << cfg.deletes << " reads=" << cfg.reads
               << " value_size=[" << cfg.min_value_size << "-" << cfg.max_value_size << "]B"
               << " miss_rate=" << cfg.miss_rate << " threads=" << cfg.threads << "\n\n";
 
     double write_seconds = run_write_phase(cfg);
     double wps = write_seconds > 0.0 ? static_cast<double>(cfg.writes) / write_seconds : 0.0;
+
+    DeleteResult dr;
+    if (cfg.deletes > 0) {
+        dr = run_delete_phase(cfg);
+    }
+    double dps = dr.seconds > 0.0 ? static_cast<double>(dr.ops) / dr.seconds : 0.0;
 
     ReadResult rr = run_read_phase(cfg);
     double rps = rr.seconds > 0.0 ? static_cast<double>(cfg.reads) / rr.seconds : 0.0;
@@ -262,6 +318,9 @@ int main(int argc, char** argv) {
     std::cout << "WRITE_OPS=" << cfg.writes << "\n";
     std::cout << "WRITE_SECONDS=" << write_seconds << "\n";
     std::cout << "WPS=" << wps << "\n";
+    std::cout << "DELETE_OPS=" << dr.ops << "\n";
+    std::cout << "DELETE_SECONDS=" << dr.seconds << "\n";
+    std::cout << "DPS=" << dps << "\n";
     std::cout << "READ_OPS=" << cfg.reads << "\n";
     std::cout << "READ_SECONDS=" << rr.seconds << "\n";
     std::cout << "RPS=" << rps << "\n";
