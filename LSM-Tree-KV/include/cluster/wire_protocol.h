@@ -66,4 +66,18 @@ std::optional<Message> decode_payload(const std::vector<uint8_t>& payload);
 // ComputeNodeServer and LeaderServer so this logic exists exactly once.
 std::optional<Message> receive_message(TcpSocket& sock);
 
+// Reads one complete frame off `sock` and returns the RAW bytes (the
+// 4-byte length prefix plus the payload, exactly as encode_* produced it)
+// without decoding. Used by LeaderServer to relay a request/response
+// unchanged to another socket -- it only needs decode_payload() on the
+// *request* side, to extract the routing key; the response can be relayed
+// byte-for-byte with no need to decode/re-encode it at all. Returns
+// nullopt on the same conditions as receive_message().
+std::optional<std::vector<uint8_t>> receive_raw_frame(TcpSocket& sock);
+
+// Extracts the routing key from a decoded PutRequest/GetRequest/
+// DeleteRequest. Returns nullopt for any other message type (a client
+// should never send a *Response or ErrorResponse as a request).
+std::optional<std::string> extract_request_key(const Message& msg);
+
 } // namespace kv_cluster

@@ -144,18 +144,45 @@ std::optional<Message> decode_payload(const std::vector<uint8_t>& payload) {
     }
 }
 
-std::optional<Message> receive_message(TcpSocket& sock) {
-    std::vector<uint8_t> len_bytes;
-    if (!sock.recv_exact(4, len_bytes)) return std::nullopt;
+namespace {
+
+// Shared by receive_message and receive_raw_frame: reads the 4-byte length
+// prefix, then that many payload bytes. Returns the length prefix bytes
+// and the payload separately so callers can either decode the payload or
+// just relay both parts verbatim as a raw frame.
+bool receive_frame_parts(TcpSocket& sock, std::vector<uint8_t>& len_bytes, std::vector<uint8_t>& payload) {
+    if (!sock.recv_exact(4, len_bytes)) return false;
     uint32_t payload_len = static_cast<uint32_t>(len_bytes[0]) |
                             (static_cast<uint32_t>(len_bytes[1]) << 8) |
                             (static_cast<uint32_t>(len_bytes[2]) << 16) |
                             (static_cast<uint32_t>(len_bytes[3]) << 24);
+    return sock.recv_exact(payload_len, payload);
+}
 
-    std::vector<uint8_t> payload;
-    if (!sock.recv_exact(payload_len, payload)) return std::nullopt;
+} // namespace
 
+std::optional<Message> receive_message(TcpSocket& sock) {
+    std::vector<uint8_t> len_bytes, payload;
+    if (!receive_frame_parts(sock, len_bytes, payload)) return std::nullopt;
     return decode_payload(payload);
+}
+
+std::optional<std::vector<uint8_t>> receive_raw_frame(TcpSocket& sock) {
+    std::vector<uint8_t> len_bytes, payload;
+    if (!receive_frame_parts(sock, len_bytes, payload)) return std::nullopt;
+
+    std::vector<uint8_t> frame;
+    frame.reserve(len_bytes.size() + payload.size());
+    frame.insert(frame.end(), len_bytes.begin(), len_bytes.end());
+    frame.insert(frame.end(), payload.begin(), payload.end());
+    return frame;
+}
+
+std::optional<std::string> extract_request_key(const Message& msg) {
+    if (auto* r = std::get_if<PutRequest>(&msg)) return r->key;
+    if (auto* r = std::get_if<GetRequest>(&msg)) return r->key;
+    if (auto* r = std::get_if<DeleteRequest>(&msg)) return r->key;
+    return std::nullopt;
 }
 
 } // namespace kv_cluster
