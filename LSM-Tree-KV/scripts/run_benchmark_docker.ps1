@@ -19,7 +19,7 @@ Set-Location (Join-Path $PSScriptRoot "..")
 $Image = "lsm-kv-benchmark:latest"
 $MemoryLimit = if ($env:MEMORY_LIMIT) { $env:MEMORY_LIMIT } else { "4g" }
 
-docker build -t $Image .
+docker build --target kv_benchmark -t $Image .
 
 $benchArgs = @("--data-dir=/home/bench/data")
 if ($env:WRITES)             { $benchArgs += "--writes=$($env:WRITES)" }

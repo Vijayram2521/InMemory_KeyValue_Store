@@ -20,7 +20,7 @@ cd "$(dirname "$0")/.."
 IMAGE="lsm-kv-benchmark:latest"
 MEMORY_LIMIT="${MEMORY_LIMIT:-4g}"
 
-docker build -t "$IMAGE" .
+docker build --target kv_benchmark -t "$IMAGE" .
 
 args=(--data-dir=/home/bench/data)
 [ -n "${WRITES:-}" ]             && args+=(--writes="$WRITES")

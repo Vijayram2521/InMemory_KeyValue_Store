@@ -1,0 +1,75 @@
+# 4-container distributed topology: 1 leader (routes client requests via
+# consistent hashing) + 3 compute nodes (each an independent StorageEngine
+# shard), each capped at 1.2GB -- replacing the single 4GB container used
+# for earlier single-node benchmarking.
+#
+# Usage:
+#   docker compose up --build          # build + start all 4 containers
+#   docker compose down -v             # stop and remove containers + data volumes
+#
+# The leader publishes port 6000 to the host; connect a client there. The
+# compute nodes are only reachable from other containers on this compose
+# network (compute-1/compute-2/compute-3 resolve via Docker's internal DNS),
+# not published to the host.
+#
+# Fixed node set for this phase -- no dynamic add/remove, see HashRing's
+# own docs for why. Named per-node volumes persist each shard's SSTables/
+# WAL across restarts (no replication yet, so losing a volume loses that
+# shard's data); the leader is stateless and gets no volume.
+
+services:
+  compute-1:
+    build:
+      context: .
+      target: compute_node
+    mem_limit: 1.2g
+    environment:
+      NODE_ID: compute-1
+      LISTEN_PORT: "7001"
+      DATA_DIR: /data
+    volumes:
+      - compute1_data:/data
+
+  compute-2:
+    build:
+      context: .
+      target: compute_node
+    mem_limit: 1.2g
+    environment:
+      NODE_ID: compute-2
+      LISTEN_PORT: "7001"
+      DATA_DIR: /data
+    volumes:
+      - compute2_data:/data
+
+  compute-3:
+    build:
+      context: .
+      target: compute_node
+    mem_limit: 1.2g
+    environment:
+      NODE_ID: compute-3
+      LISTEN_PORT: "7001"
+      DATA_DIR: /data
+    volumes:
+      - compute3_data:/data
+
+  leader:
+    build:
+      context: .
+      target: leader_node
+    mem_limit: 1.2g
+    environment:
+      LISTEN_PORT: "6000"
+      COMPUTE_NODES: "compute-1:compute-1:7001,compute-2:compute-2:7001,compute-3:compute-3:7001"
+    ports:
+      - "6000:6000"
+    depends_on:
+      - compute-1
+      - compute-2
+      - compute-3
+
+volumes:
+  compute1_data:
+  compute2_data:
+  compute3_data:
