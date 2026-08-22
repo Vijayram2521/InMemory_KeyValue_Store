@@ -55,7 +55,15 @@ FROM debian:bookworm-slim AS compute_node
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libstdc++6 \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --create-home --shell /usr/sbin/nologin cnode
+    && useradd --create-home --shell /usr/sbin/nologin cnode \
+    # /data is where docker-compose mounts each compute node's named
+    # volume. A fresh named volume is root-owned by default; baking this
+    # directory into the image with cnode ownership first means Docker's
+    # volume copy-up (an empty named volume inherits the mount point's
+    # existing content/permissions from the image on first use) carries
+    # that ownership over, so the non-root cnode user can actually write
+    # its WAL/SSTables there instead of crashing on startup.
+    && mkdir -p /data && chown cnode:cnode /data
 
 COPY --from=build /src/build/compute_node /app/compute_node
 
