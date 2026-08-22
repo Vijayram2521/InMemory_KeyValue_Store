@@ -27,6 +27,11 @@ services:
       NODE_ID: compute-1
       LISTEN_PORT: "7001"
       DATA_DIR: /data
+      # Matches the single-node "biggest" benchmark's own memtable-threshold
+      # exactly, so a distributed run at that same benchmark's key count is
+      # a fair comparison (same per-generation sizing parameter; naturally
+      # fewer generations per node purely because each node holds less data).
+      MEMTABLE_THRESHOLD: "100000"
     volumes:
       - compute1_data:/data
 
@@ -39,6 +44,7 @@ services:
       NODE_ID: compute-2
       LISTEN_PORT: "7001"
       DATA_DIR: /data
+      MEMTABLE_THRESHOLD: "100000"
     volumes:
       - compute2_data:/data
 
@@ -51,6 +57,7 @@ services:
       NODE_ID: compute-3
       LISTEN_PORT: "7001"
       DATA_DIR: /data
+      MEMTABLE_THRESHOLD: "100000"
     volumes:
       - compute3_data:/data
 
