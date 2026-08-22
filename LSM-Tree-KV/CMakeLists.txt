@@ -67,3 +67,18 @@ target_link_libraries(kv_benchmark kv_engine Threads::Threads)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9.0)
     target_link_libraries(kv_benchmark stdc++fs)
 endif()
+
+# 8. Distributed leader/compute-node layer -- POSIX sockets. The project has
+# moved to targeting Unix exclusively (perf testing and deployment are both
+# Linux-only already), so this is unconditional rather than platform-gated.
+add_library(
+    kv_cluster
+    src/cluster/hash_ring.cpp
+    src/cluster/wire_protocol.cpp
+    src/cluster/tcp_socket.cpp
+)
+target_link_libraries(kv_cluster kv_engine Threads::Threads)
+
+add_executable(kv_cluster_tests src/cluster_test_main.cpp tests/test_hash_ring.cpp tests/test_wire_protocol.cpp)
+target_link_libraries(kv_cluster_tests kv_cluster kv_engine)
+add_test(NAME kv_cluster_tests COMMAND kv_cluster_tests WORKING_DIRECTORY ${CMAKE_BINARY_DIR})

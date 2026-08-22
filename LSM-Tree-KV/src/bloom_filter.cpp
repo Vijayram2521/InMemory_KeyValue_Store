@@ -1,28 +1,10 @@
 #include "engine/bloom_filter.h"
+#include "engine/hash_utils.h"
 
 #include <algorithm>
 #include <cstdint>
 
 namespace kv_engine {
-
-namespace {
-
-// FNV-1a: a small, fast, well-distributed non-cryptographic hash. `seed`
-// perturbs the offset basis so the same key produces two genuinely
-// different-looking hashes for h1 and h2 below, rather than reusing one
-// hash function's output twice.
-uint64_t fnv1a(const std::string& s, uint64_t seed) {
-    constexpr uint64_t kFnvOffsetBasis = 1469598103934665603ULL;
-    constexpr uint64_t kFnvPrime = 1099511628211ULL;
-    uint64_t hash = kFnvOffsetBasis ^ seed;
-    for (unsigned char c : s) {
-        hash ^= c;
-        hash *= kFnvPrime;
-    }
-    return hash;
-}
-
-} // namespace
 
 BloomFilter::BloomFilter(size_t expected_keys)
     : bits_(std::max<size_t>(expected_keys * kBitsPerKey, 64), false) {}
