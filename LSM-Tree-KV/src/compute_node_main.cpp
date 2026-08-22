@@ -37,6 +37,15 @@ int main(int argc, char** argv) {
     std::string node_id = env_or("NODE_ID", "compute-node");
     std::string port_str = env_or("LISTEN_PORT", "7001");
     std::string data_dir = env_or("DATA_DIR", "./data");
+    // StorageEngine's own default (5) is deliberately tiny, sized for fast
+    // unit tests -- fine there, but at any real dataset size it produces
+    // one SSTable generation every 5 writes (hundreds of thousands of
+    // generations for a benchmark-scale shard), which is exactly the
+    // pathological many-generations scenario this project's own
+    // benchmarking already measured as devastating for read throughput.
+    // 50,000 is a much more reasonable operational default; still
+    // overridable per-deployment via MEMTABLE_THRESHOLD/--memtable-threshold.
+    std::string memtable_threshold_str = env_or("MEMTABLE_THRESHOLD", "50000");
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -44,19 +53,25 @@ int main(int argc, char** argv) {
         if (parse_flag(arg, "node-id", val)) node_id = val;
         else if (parse_flag(arg, "port", val)) port_str = val;
         else if (parse_flag(arg, "data-dir", val)) data_dir = val;
+        else if (parse_flag(arg, "memtable-threshold", val)) memtable_threshold_str = val;
         else if (arg == "--help" || arg == "-h") {
             std::cout << "compute_node -- runs one StorageEngine shard, served over TCP.\n"
-                         "Config via env vars (NODE_ID, LISTEN_PORT, DATA_DIR) or flags:\n"
-                         "  --node-id=ID    identifies this node in logs (default: compute-node)\n"
-                         "  --port=N        TCP port to listen on (default: 7001)\n"
-                         "  --data-dir=PATH StorageEngine data directory (default: ./data)\n";
+                         "Config via env vars (NODE_ID, LISTEN_PORT, DATA_DIR, MEMTABLE_THRESHOLD)\n"
+                         "or flags:\n"
+                         "  --node-id=ID              identifies this node in logs (default: compute-node)\n"
+                         "  --port=N                  TCP port to listen on (default: 7001)\n"
+                         "  --data-dir=PATH           StorageEngine data directory (default: ./data)\n"
+                         "  --memtable-threshold=N    entries buffered before a flush (default: 50000;\n"
+                         "                            StorageEngine's own default of 5 is sized for unit\n"
+                         "                            tests, not real data volumes)\n";
             return 0;
         }
     }
 
     uint16_t port = static_cast<uint16_t>(std::stoul(port_str));
+    size_t memtable_threshold = std::stoull(memtable_threshold_str);
 
-    kv_engine::StorageEngine engine(data_dir);
+    kv_engine::StorageEngine engine(data_dir, memtable_threshold);
     kv_cluster::ComputeNodeServer server(engine);
     if (!server.start(port)) {
         std::cerr << "compute_node[" << node_id << "]: failed to listen on port " << port << std::endl;
