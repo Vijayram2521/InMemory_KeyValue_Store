@@ -2,8 +2,8 @@
 
 A high-performance, persistent Key-Value storage engine built from scratch in C++. This project implements a **Log-Structured Merge-Tree (LSM-Tree)** architecture, modeled after industry standards like RocksDB and AlloyDB, optimized for high write throughput and durable storage.
 
-## 📊 Project Status: Phase 4 Complete (Indexed Search)
-We have successfully transitioned from a volatile in-memory store to a durable engine capable of surviving crashes, managing on-disk sorted files, and finding a key in any of them without scanning the file.
+## 📊 Project Status: Phase 4 Complete (Indexed Search) + Distributed Cluster (single-shard perf validated)
+We have successfully transitioned from a volatile in-memory store to a durable engine capable of surviving crashes, managing on-disk sorted files, and finding a key in any of them without scanning the file. On top of that, a distributed leader + compute-node architecture now exists and is perf-validated end to end -- see "Distributed Architecture" below.
 
 ### Completed Features
 * **Durable Write-Ahead Log (WAL):** Every operation is logged to an append-only binary file with sequence numbers before touching RAM, ensuring zero data loss on crashes.
@@ -16,6 +16,7 @@ We have successfully transitioned from a volatile in-memory store to a durable e
 * **Bloom Filters:** One filter per SSTable, checked before opening the file at all. See Phase 5 in the Roadmap below for the full writeup (hashing scheme, sizing, measured false-positive rate).
 * **Test Suite:** Real assertions (not print-and-eyeball output) via a small header-only framework, wired into CTest. 36 checks covering WAL crash recovery, SSTable flush/restart, tombstone resurrection, Manifest, StorageEngine edge cases (overwrite, delete-then-revive), the SSTable index/binary-search path, and the Bloom filter's no-false-negatives guarantee plus measured false-positive rate.
 * **Throughput Benchmark:** `kv_benchmark` times writes and reads separately against a workload sized deliberately against a 2GB memory budget (see "Benchmarking" below), with every value an independently random size and 15% of reads guaranteed misses -- runnable natively or in a Docker container capped at `--memory=4g`.
+* **Distributed Cluster:** A leader node routes PUT/GET/DELETE to one of several compute nodes via consistent hashing; each compute node is just an unmodified `StorageEngine` serving its own keyspace shard over a hand-rolled binary TCP protocol. See "Distributed Architecture" below for the design and `cluster_benchmark`'s real, measured numbers against the live deployed cluster.
 
 ---
 
@@ -160,6 +161,73 @@ Lookup: seek to EOF-20, read footer --> binary_search(index) in memory
 
 ---
 
+## 🌐 Distributed Architecture
+
+Motivated directly by the Bloom filter finding above: at real scale (33
+generations, ~18GB dataset) the read bottleneck turned out to be disk I/O
+bandwidth for genuinely necessary reads, not `open()` call count -- a
+problem no single-node optimization can fix, only reducing the amount of
+data any one node has to serve can. So the engine is now shardable: a thin
+leader routes requests to one of several compute nodes via consistent
+hashing, and each compute node is just an ordinary, unmodified
+`StorageEngine` -- the sharding layer doesn't touch the storage engine at
+all, it sits entirely on top of it.
+
+```
+             +--------------------------------+             
+             |             Client             |             
+             | Put(k,v) / Get(k) / Delete(k)  |             
+             +--------------------------------+             
+                              |
+                              v
+             +--------------------------------+             
+             |      Leader (leader_node)      |             
+             | accept, thread-per-connection  |             
+             |     HashRing.get_node(key)     |             
+             +--------------------------------+             
+                              |
+                              v  relay raw request/response bytes,
+                                 no decode/re-encode except the routing key
++------------------------+   +------------------------+   +------------------------+
+|       Compute-1        |   |       Compute-2        |   |       Compute-3        |
+|  StorageEngine shard   |   |  StorageEngine shard   |   |  StorageEngine shard   |
+| own WAL/SSTables/Bloom |   | own WAL/SSTables/Bloom |   | own WAL/SSTables/Bloom |
++------------------------+   +------------------------+   +------------------------+
+```
+
+### Design decisions (this phase)
+* **Wire protocol:** hand-rolled binary framing (`[4B length][1B type][fields]`), mirroring the same length-prefixed record framing already used on disk in `wal.cpp`/`sstable.cpp`, rather than pulling in JSON/HTTP/gRPC -- consistent with this project's zero-external-dependency, built-from-scratch approach throughout. Same protocol both client&harr;leader and leader&harr;compute-node; the leader relays raw frame bytes in both directions and only decodes far enough to extract the routing key from a request.
+* **Consistent hashing, deliberately minimal:** one ring point per node (no virtual nodes), fixed membership set once at leader startup (no live add/remove). Reuses the same FNV-1a hash `BloomFilter` already uses (extracted to `include/engine/hash_utils.h`), passed through a MurmurHash3 finalizer (`avalanche()`) -- needed for real: raw FNV-1a output isn't uniformly spread across the 64-bit space for structurally similar short strings, which routed 100% of a 50,000-key test sample to a single node before this fix (confirmed via a standalone diagnostic, not guessed at).
+* **No new locking anywhere in the cluster layer.** Each compute node wraps exactly one `StorageEngine`, which already owns a `std::shared_mutex` governing all access to it; connection-handler threads call straight into its already-thread-safe `Put`/`Get`/`Delete`. One lock per physical node, exactly as before.
+* **Manifest/WAL: zero sharing, by construction.** Each compute node holds a disjoint keyspace shard, so there's never a scenario where two nodes' Manifests or WALs need to coordinate -- each just runs the unmodified `StorageEngine` against its own data directory.
+* **Fail loud, not silently:** if the leader can't reach the compute node a key routes to, the client gets an `ERROR_RESPONSE`, not a retry loop or a hung connection.
+* **Explicitly deferred to a future phase:** virtual nodes (needed for real load balancing across few physical nodes), live add/remove of compute nodes with data rebalancing, failover, and replication. The `HashRing`/wire-protocol shapes were chosen so these are additive later, not a rewrite -- but none of them exist yet, not even as unwired dead code.
+
+### Verified, not just implemented
+* **43 new automated checks** (`kv_cluster_tests`, a separate CTest target so the core 36-check `kv_tests` binary stays exactly as fast and platform-neutral as before): `HashRing` determinism/coverage, wire-protocol round-trips for every message type plus malformed-input handling, and a full integration test that spins up 3 `ComputeNodeServer`s + 1 `LeaderServer` in-process on ephemeral ports and drives real PUT/GET/DELETE through actual TCP sockets -- including verifying, against an independently-computed `HashRing` prediction, that every one of 60 test keys landed in *exactly* the compute node consistent hashing predicts, not just that *some* node answered correctly.
+* **Real `docker compose up` deployment**, not just a build that compiles: 4 containers (1 leader + 3 compute, each `mem_limit: 1.2g`), verified healthy and staying up (not crash-looping). A standalone smoke-test client -- a separate process, not part of the test suite, built and run on the VM against the actually-running leader on its published port -- drove real PUT/GET/DELETE over the real Docker network. Cross-node routing was confirmed at the deployment level too: `docker compose exec <node> ls -la /data` showed different keys landing in different compute nodes' data directories.
+* **Four real bugs found and fixed during this**, each with actual evidence rather than assumed away: the FNV-1a clustering issue above; `ComputeNodeServer::stop()` hanging indefinitely because closing a listening socket from another thread doesn't reliably unblock a thread already parked in `accept()` (confirmed hung for real via `timeout 15`, fixed with `poll()`-based polling instead of a blocking `accept()` call); compute nodes crashing on startup in the real deployment (`Failed to open WAL file`) because a fresh Docker named volume is root-owned by default while the container runs as a non-root user (fixed the standard way -- bake the data directory into the image with correct ownership before the volume ever mounts there, so Docker's volume copy-up carries it over); and `compute_node` silently using `StorageEngine`'s tiny unit-test-sized default `memtable_threshold` (5) instead of a real operational one, which would have produced hundreds of thousands of SSTable generations per shard at benchmark scale -- caught by inspection before running the real benchmark, not after getting a misleading number.
+
+### Perf: distributed cluster vs. single node, same workload
+`cluster_benchmark` (new: drives PUT/GET through a real `leader_node` over TCP, since `kv_benchmark` only ever talks to an in-process `StorageEngine`) was run against the live deployed cluster with the exact same workload as the single-node "large" benchmark above (1,000,000 writes, 10,000,000 reads, 4 threads, default 64-1024B values) for a direct, apples-to-apples comparison:
+
+| Metric | Single-node (in-process) | Distributed (leader + 3 compute nodes) | Ratio |
+|---|---|---|---|
+| WPS | ~89,470 | 22,663.7 | ~3.95x slower |
+| RPS | ~351,649 | 21,521.1 | ~16.34x slower |
+| Avg. write latency (4 threads) | ~44.7us | ~176.5us | +~131.8us |
+| Avg. read latency (4 threads) | ~11.4us | ~185.9us | +~174.5us |
+
+(Latency = threads / throughput, not 1 / throughput -- both benchmarks run 4 concurrent threads, so this accounts for that rather than mixing a per-thread number against an aggregate one.)
+
+**The distributed cluster is slower here, and that's expected, not a bug** -- at this dataset size (1,000,000 keys, well within what a single node handles comfortably, as the numbers above show) sharding has no problem to solve yet, so all it adds is network overhead with no compensating benefit. Each client operation costs two sequential network round trips, not one: client&rarr;leader, then leader&rarr;compute-node, both synchronous within the same request (`cluster_benchmark` doesn't pipeline requests, matching how a real client driving one op at a time would behave). ~130-175us of *added* latency per op (on top of the single-node engine's own already-real cost) for two Docker-bridge-network hops plus wire-protocol encode/decode is a plausible, not alarming, cost -- it's what you pay to turn an in-process function call into two network hops.
+
+**The real test of the sharding hypothesis isn't this comparison -- it's the same total keyspace, sharded, at the scale where a single node struggled.** The "biggest" single-node benchmark (33 generations, ~18GB, 3,000,000 keys) measured ~4,412 RPS specifically because per-node data volume had outgrown what fits comfortably in page cache. Sharding that same 3,000,000 keys across 3 nodes (~1,000,000 each, close to what was just benchmarked here) should let each node stay in the regime where it performs well, potentially outweighing the ~176-186us network tax measured above. That comparison -- distributed-at-the-scale-where-a-single-node-struggles vs. single-node-struggling -- is the one that actually tests whether this architecture solves the problem it was built for, and is the natural next benchmarking step, not yet run.
+
+Reproduce: `docker compose up --build -d`, then `./build/cluster_benchmark --leader-port=6000 --writes=1000000 --reads=10000000` (or point `--leader-host`/`--leader-port` at a remote deployment).
+
+---
+
 ## 🗺️ Roadmap: What's Next?
 
 ### Phase 4: High-Performance Search (Indexing) -- ✅ Complete
@@ -176,27 +244,42 @@ Lookup: seek to EOF-20, read footer --> binary_search(index) in memory
 * [ ] **Value Compression:** Compress each value (LZ4 is the natural choice -- fast enough that decompression cost on the read path stays negligible next to the I/O costs above, unlike heavier schemes optimized for ratio over speed) before writing it into an SSTable record, decompressing on read. Per-value rather than per-block: it fits this project's existing record framing (type + kLen + key + vLen + value) without restructuring the file format, at the cost of losing the better compression ratio a shared block-level dictionary would give across many small values. Matters most for the "large values" benchmark configuration (512-4096B, see below) -- that's exactly the value-size range where compression has real bytes to work with, unlike the earlier 64-1024B default where per-value overhead would dominate any savings.
 * [ ] **Snapshots:** Implement point-in-time consistent views of the database.
 
+### Phase 7: Distributed Architecture -- ✅ Implementation & single-shard perf validated
+* [x] **Leader + compute-node sharding:** see "Distributed Architecture" above for the full design, verification, and benchmark writeup. Consistent-hash routing, hand-rolled binary wire protocol, real `docker compose` deployment (4 containers, 1.2GB each), 43 new automated checks, 4 real bugs found and fixed with evidence.
+* [x] **Perf validated at the single-shard-comparable scale** (1M writes/10M reads, same as the single-node "large" benchmark): distributed is ~4-16x slower here, as expected -- see the writeup above for why (two network hops per op, no problem yet for sharding to solve at this data volume).
+* [ ] **Perf validated at the scale sharding is actually for:** re-run at the "biggest" single-node benchmark's scale (3,000,000 keys, sharded ~1M/node) and compare against that benchmark's ~4,412 RPS -- the comparison that actually tests whether this architecture solves the problem it was built for. Not yet run.
+* [ ] **Resize workflow:** dynamic add/remove of compute nodes with data rebalancing. `HashRing` was deliberately kept minimal (fixed membership, no virtual nodes) specifically so this phase can extend it rather than rewrite it.
+* [ ] **Virtual nodes:** needed for real load balance across a small number of physical nodes -- deferred alongside resize since they're most useful once membership can actually change.
+* [ ] **Failover:** detect and route around an unreachable compute node instead of just failing the request loud (current behavior).
+* [ ] **Replication:** currently each key lives on exactly one compute node -- losing a node's volume loses that shard's data.
+
 ---
 
 ## 🛠️ Getting Started
 
 ### Prerequisites
-* **Windows 10/11**
-* **MSYS2 UCRT64** Environment
-* **CMake** (MSYS2 version)
-* **C++23** compatible compiler (GCC 13+)
+This project targets **Unix (Linux) exclusively** -- the distributed layer
+(`compute_node`/`leader_node`) uses POSIX sockets directly, and perf
+testing/deployment have always been Linux-only in practice, so there's no
+Windows compatibility gate to maintain.
+* **CMake** 3.15+
+* **C++17** compatible compiler (GCC 9+ recommended)
+* **Docker** + **Docker Compose v2** (for the distributed cluster and containerized benchmarking)
 
 ### Build & Run
 ```bash
 # From LSM-Tree-KV/, configure, build, and run the unit test suite via CTest
-./scripts/run_tests.sh      # bash / MSYS2
-./scripts/run_tests.ps1     # PowerShell
+./scripts/run_tests.sh
 ```
-This builds two binaries into `build/`: `kv_tests` (the unit test suite,
-registered with CTest) and `kv_benchmark` (the throughput benchmark below).
-There is currently no interactive CLI -- `StorageEngine` is used as an
-in-process library (see `src/main.cpp` / `src/benchmark.cpp` for usage
-examples).
+This builds `kv_tests` (the core engine test suite, 36 checks),
+`kv_cluster_tests` (the distributed-layer test suite, 43 checks -- see
+"Distributed Architecture" above), `kv_benchmark` (the single-node
+throughput benchmark below), and `cluster_benchmark` (the distributed
+throughput benchmark, see above), all registered with CTest. There is no
+interactive single-node CLI -- `StorageEngine` is used as an in-process
+library directly (see `src/main.cpp` / `src/benchmark.cpp`) or served over
+the network via `compute_node`/`leader_node` (see "Distributed
+Architecture" above).
 
 ### Benchmarking (Docker)
 `kv_benchmark` times up to three phases separately against a single
