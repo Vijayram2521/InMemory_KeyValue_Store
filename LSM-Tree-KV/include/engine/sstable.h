@@ -22,6 +22,15 @@ namespace kv_engine {
         uint64_t offset = 0;
     };
 
+    // One decoded data-block record, as returned by read_all -- used by
+    // compaction, which needs full record content (not just key+offset) to
+    // merge two SSTables' data.
+    struct Record {
+        std::string key;
+        std::string value;
+        bool is_tombstone = false;
+    };
+
     // On-disk layout written by write_file:
     //   [data block]  PUT/DELETE records for every key, in a single merged
     //                 ascending-key sequence (not "all puts then all
@@ -51,6 +60,15 @@ namespace kv_engine {
         // Returns an empty vector if the file is missing, empty, or not in
         // this format (footer magic mismatch).
         static std::vector<IndexEntry> load_index(const std::string& filename);
+
+        // Reads the footer to find where the data block ends, then
+        // sequentially decodes every PUT/DELETE record from the start of
+        // the file up to that point, in the same ascending-key order they
+        // were written in. Used by compaction, which needs full record
+        // content (not just key+offset) to merge two SSTables. Returns an
+        // empty vector under the same conditions load_index does (missing,
+        // empty, or non-matching-magic file).
+        static std::vector<Record> read_all(const std::string& filename);
 
         // Binary searches the (already sorted) `index` for `key`. On a
         // match, seeks straight to its byte offset and reads that one

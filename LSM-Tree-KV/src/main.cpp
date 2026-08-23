@@ -35,6 +35,9 @@ int main() {
         kv_tests::run_test_storage_engine_generations();
         std::cout << std::endl;
 
+        kv_tests::run_test_compaction();
+        std::cout << std::endl;
+
         const auto& s = kv_tests::stats();
         std::cout << "===================================" << std::endl;
         std::cout << "Results: " << s.passed << " passed, " << s.failed << " failed" << std::endl;

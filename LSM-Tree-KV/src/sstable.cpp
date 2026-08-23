@@ -134,6 +134,51 @@ std::vector<IndexEntry> SSTable::load_index(const std::string& filename) {
     return index;
 }
 
+std::vector<Record> SSTable::read_all(const std::string& filename) {
+    std::vector<Record> records;
+    std::ifstream ifs(filename, std::ios::binary);
+    if (!ifs.is_open()) return records;
+
+    ifs.seekg(0, std::ios::end);
+    std::streamoff file_size = ifs.tellg();
+    if (file_size < static_cast<std::streamoff>(kFooterSize)) return records;
+
+    ifs.seekg(file_size - static_cast<std::streamoff>(kFooterSize));
+    uint64_t index_offset = 0, index_count = 0;
+    uint32_t magic = 0;
+    if (!ifs.read(reinterpret_cast<char*>(&index_offset), sizeof(index_offset))) return records;
+    if (!ifs.read(reinterpret_cast<char*>(&index_count), sizeof(index_count))) return records;
+    if (!ifs.read(reinterpret_cast<char*>(&magic), sizeof(magic))) return records;
+    if (magic != static_cast<uint32_t>(kSSTableMagic)) return records;
+
+    // Data block is a single ascending-key sequence from offset 0 up to
+    // index_offset -- read it sequentially rather than seeking per record,
+    // since each record starts exactly where the previous one ended.
+    ifs.seekg(0, std::ios::beg);
+    while (static_cast<uint64_t>(ifs.tellg()) < index_offset) {
+        char type_raw;
+        if (!ifs.read(&type_raw, 1)) break;
+        uint8_t type = static_cast<uint8_t>(type_raw);
+
+        uint32_t kLen = 0;
+        if (!ifs.read(reinterpret_cast<char*>(&kLen), sizeof(kLen))) break;
+        std::string key(kLen, '\0');
+        if (kLen > 0 && !ifs.read(&key[0], kLen)) break;
+
+        if (type == 2) { // DELETE / tombstone -- no value bytes follow
+            records.push_back({std::move(key), "", true});
+            continue;
+        }
+
+        uint32_t vLen = 0;
+        if (!ifs.read(reinterpret_cast<char*>(&vLen), sizeof(vLen))) break;
+        std::string value(vLen, '\0');
+        if (vLen > 0 && !ifs.read(&value[0], vLen)) break;
+        records.push_back({std::move(key), std::move(value), false});
+    }
+    return records;
+}
+
 SearchResult SSTable::search_with_index(const std::string& filename,
                                          const std::vector<IndexEntry>& index,
                                          const std::string& key) {

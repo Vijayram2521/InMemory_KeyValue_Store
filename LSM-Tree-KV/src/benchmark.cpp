@@ -153,6 +153,7 @@ struct BenchConfig {
     size_t memtable_threshold = kDefaultMemtableThreshold;
     unsigned threads = kDefaultThreads;
     bool keep_data = false;
+    bool enable_compaction = false;
     std::chrono::seconds progress_interval{10}; // 0 disables progress lines entirely
 };
 
@@ -196,6 +197,11 @@ void print_usage() {
         "                          trip idle-connection timeouts on whatever's capturing\n"
         "                          this process's output over a long-lived pipe (e.g. SSH).\n"
         "  --keep-data             do not delete data-dir when done\n"
+        "  --enable-compaction     run background compaction (merges the two oldest SSTable\n"
+        "                          generations at a time, never the newest) throughout the\n"
+        "                          write/delete/read phases, instead of leaving every flushed\n"
+        "                          generation on disk forever (default: off, matching prior\n"
+        "                          benchmark behavior, for an A/B-comparable baseline)\n"
         "  --help                  show this message\n\n"
         "Note: every SSTable lookup binary-searches that file's cached index and does a\n"
         "single seekg -- there's no linear scan, so read cost no longer grows with total\n"
@@ -247,6 +253,8 @@ BenchConfig parse_args(int argc, char** argv) {
             cfg.progress_interval = std::chrono::seconds(std::stoll(val));
         } else if (arg == "--keep-data") {
             cfg.keep_data = true;
+        } else if (arg == "--enable-compaction") {
+            cfg.enable_compaction = true;
         } else {
             std::cerr << "Unknown argument: " << arg << " (--help for usage)\n";
             std::exit(1);
@@ -524,7 +532,8 @@ int main(int argc, char** argv) {
               << " miss_rate=" << cfg.miss_rate
               << " memtable_threshold=" << cfg.memtable_threshold
               << " threads=" << cfg.threads
-              << " data_dir=" << cfg.data_dir << "\n\n";
+              << " data_dir=" << cfg.data_dir
+              << " compaction=" << (cfg.enable_compaction ? "on" : "off") << "\n\n";
 
     WriteResult wr;
     DeleteResult dr;
@@ -534,6 +543,9 @@ int main(int argc, char** argv) {
         // before we try to remove_all(data_dir) below -- Windows refuses to
         // delete a directory containing a file another handle still has open.
         StorageEngine engine(cfg.data_dir, cfg.memtable_threshold);
+        if (cfg.enable_compaction) {
+            engine.StartBackgroundCompaction();
+        }
         wr = run_write_phase(engine, cfg);
         if (cfg.deletes > 0) {
             dr = run_delete_phase(engine, cfg);

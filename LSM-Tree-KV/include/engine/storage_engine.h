@@ -1,6 +1,7 @@
 #ifndef STORAGE_ENGINE_H
 #define STORAGE_ENGINE_H
 
+#include <chrono>
 #include <string>
 #include <optional>
 #include <vector>
@@ -45,6 +46,36 @@ namespace kv_engine {
              * Forces a flush of the MemTable to disk.
              */
             void ForceFlush();
+
+            /**
+             * Runs one compaction pass synchronously: merges the two oldest
+             * flushed SSTable generations into one, dropping obsolete
+             * overwritten values and tombstones that provably shadow
+             * nothing older. Never touches the newest generation. Requires
+             * at least 3 flushed generations to do anything.
+             * @return true if a merge happened, false if nothing was
+             * eligible. Thread-safe; safe to call concurrently with
+             * Put/Get/Delete and while background compaction is running
+             * (compaction passes never overlap each other).
+             */
+            bool CompactOnce();
+
+            /**
+             * Starts a background thread that repeatedly runs CompactOnce()
+             * (looping until nothing is left to merge, then sleeping for
+             * poll_interval) until StopBackgroundCompaction() is called or
+             * the engine is destroyed. The slow part of a compaction pass
+             * (reading, merging, writing) holds no lock, so this never
+             * meaningfully blocks concurrent Get/Put/Delete. No-op if
+             * already running.
+             */
+            void StartBackgroundCompaction(std::chrono::seconds poll_interval = std::chrono::seconds(5));
+
+            /**
+             * Stops the background compaction thread if running. No-op if
+             * not running. Also called from the destructor.
+             */
+            void StopBackgroundCompaction();
         private:
             // Mem Table management and WAL handling
             struct Impl;

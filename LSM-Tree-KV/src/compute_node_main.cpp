@@ -46,6 +46,8 @@ int main(int argc, char** argv) {
     // 50,000 is a much more reasonable operational default; still
     // overridable per-deployment via MEMTABLE_THRESHOLD/--memtable-threshold.
     std::string memtable_threshold_str = env_or("MEMTABLE_THRESHOLD", "50000");
+    bool enable_compaction = env_or("ENABLE_COMPACTION", "") == "1"
+                           || env_or("ENABLE_COMPACTION", "") == "true";
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -54,16 +56,19 @@ int main(int argc, char** argv) {
         else if (parse_flag(arg, "port", val)) port_str = val;
         else if (parse_flag(arg, "data-dir", val)) data_dir = val;
         else if (parse_flag(arg, "memtable-threshold", val)) memtable_threshold_str = val;
+        else if (arg == "--enable-compaction") enable_compaction = true;
         else if (arg == "--help" || arg == "-h") {
             std::cout << "compute_node -- runs one StorageEngine shard, served over TCP.\n"
-                         "Config via env vars (NODE_ID, LISTEN_PORT, DATA_DIR, MEMTABLE_THRESHOLD)\n"
-                         "or flags:\n"
+                         "Config via env vars (NODE_ID, LISTEN_PORT, DATA_DIR, MEMTABLE_THRESHOLD,\n"
+                         "ENABLE_COMPACTION) or flags:\n"
                          "  --node-id=ID              identifies this node in logs (default: compute-node)\n"
                          "  --port=N                  TCP port to listen on (default: 7001)\n"
                          "  --data-dir=PATH           StorageEngine data directory (default: ./data)\n"
                          "  --memtable-threshold=N    entries buffered before a flush (default: 50000;\n"
                          "                            StorageEngine's own default of 5 is sized for unit\n"
-                         "                            tests, not real data volumes)\n";
+                         "                            tests, not real data volumes)\n"
+                         "  --enable-compaction       run background compaction on this shard (default:\n"
+                         "                            off, matching prior deployment behavior)\n";
             return 0;
         }
     }
@@ -72,13 +77,17 @@ int main(int argc, char** argv) {
     size_t memtable_threshold = std::stoull(memtable_threshold_str);
 
     kv_engine::StorageEngine engine(data_dir, memtable_threshold);
+    if (enable_compaction) {
+        engine.StartBackgroundCompaction();
+    }
     kv_cluster::ComputeNodeServer server(engine);
     if (!server.start(port)) {
         std::cerr << "compute_node[" << node_id << "]: failed to listen on port " << port << std::endl;
         return 1;
     }
     std::cout << "compute_node[" << node_id << "]: listening on port " << server.port()
-              << ", data_dir=" << data_dir << std::endl;
+              << ", data_dir=" << data_dir
+              << ", compaction=" << (enable_compaction ? "on" : "off") << std::endl;
 
     std::signal(SIGINT, handle_shutdown_signal);
     std::signal(SIGTERM, handle_shutdown_signal);
