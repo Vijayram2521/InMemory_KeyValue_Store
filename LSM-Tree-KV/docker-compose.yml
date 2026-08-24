@@ -33,10 +33,11 @@ services:
       # fewer generations per node purely because each node holds less data).
       MEMTABLE_THRESHOLD: "100000"
       # Background compaction (merges the two oldest SSTable generations at
-      # a time, size-ratio gated -- see storage_engine.cpp) -- opt-in,
-      # matched to the single-node "biggest + compaction" benchmark row so
-      # the comparison in README.md's Performance Results is apples-to-apples.
-      ENABLE_COMPACTION: "1"
+      # a time, size-ratio gated -- see storage_engine.cpp). Set via
+      # `ENABLE_COMPACTION=1 docker compose up -d` (defaults to off) so the
+      # same file drives both the compacted and non-compacted comparison
+      # runs without hand-editing between them.
+      ENABLE_COMPACTION: "${ENABLE_COMPACTION:-0}"
     volumes:
       - compute1_data:/data
 
@@ -50,7 +51,10 @@ services:
       LISTEN_PORT: "7001"
       DATA_DIR: /data
       MEMTABLE_THRESHOLD: "100000"
-      ENABLE_COMPACTION: "1"
+      # Set via `ENABLE_COMPACTION=1 docker compose up -d` (defaults to
+      # off) so the same file drives both the compacted and non-compacted
+      # comparison runs without hand-editing between them.
+      ENABLE_COMPACTION: "${ENABLE_COMPACTION:-0}"
     volumes:
       - compute2_data:/data
 
@@ -64,7 +68,10 @@ services:
       LISTEN_PORT: "7001"
       DATA_DIR: /data
       MEMTABLE_THRESHOLD: "100000"
-      ENABLE_COMPACTION: "1"
+      # Set via `ENABLE_COMPACTION=1 docker compose up -d` (defaults to
+      # off) so the same file drives both the compacted and non-compacted
+      # comparison runs without hand-editing between them.
+      ENABLE_COMPACTION: "${ENABLE_COMPACTION:-0}"
     volumes:
       - compute3_data:/data
 
