@@ -45,6 +45,20 @@ struct BenchConfig {
     double miss_rate = 0.15;
     unsigned threads = 4;
     std::chrono::seconds progress_interval{10};
+
+    // Mixed-phase: opt-in (all 0 by default -> old behavior). See
+    // kv_benchmark.cpp's run_mixed_phase for the full design rationale --
+    // this mirrors it exactly, just sending wire-protocol requests to the
+    // leader instead of calling a local StorageEngine directly.
+    size_t mixed_reads = 0;
+    size_t mixed_writes = 0;
+    size_t mixed_deletes = 0;
+
+    // See kv_benchmark.cpp's BenchConfig::drop_caches_before_read for the
+    // full rationale -- identical mechanism here, dropped on the VM host
+    // (compute node containers share the host kernel's page cache for
+    // their volume-backed files, so this evicts their cached data too).
+    bool drop_caches_before_read = false;
 };
 
 bool parse_flag(const std::string& arg, const std::string& name, std::string& out) {
@@ -70,6 +84,10 @@ BenchConfig parse_args(int argc, char** argv) {
         else if (parse_flag(arg, "miss-rate", val)) cfg.miss_rate = std::stod(val);
         else if (parse_flag(arg, "threads", val)) cfg.threads = static_cast<unsigned>(std::stoul(val));
         else if (parse_flag(arg, "progress-interval", val)) cfg.progress_interval = std::chrono::seconds(std::stoll(val));
+        else if (parse_flag(arg, "mixed-reads", val)) cfg.mixed_reads = std::stoull(val);
+        else if (parse_flag(arg, "mixed-writes", val)) cfg.mixed_writes = std::stoull(val);
+        else if (parse_flag(arg, "mixed-deletes", val)) cfg.mixed_deletes = std::stoull(val);
+        else if (arg == "--drop-caches-before-read") cfg.drop_caches_before_read = true;
         else if (arg == "--help" || arg == "-h") {
             std::cout << "cluster_benchmark - drives PUT/GET through a real leader_node over TCP\n"
                          "  --leader-host=HOST      (default 127.0.0.1)\n"
@@ -81,7 +99,17 @@ BenchConfig parse_args(int argc, char** argv) {
                          "  --min-value-size=N / --max-value-size=N  (default 64/1024)\n"
                          "  --miss-rate=F           (default 0.15)\n"
                          "  --threads=N             (default 4)\n"
-                         "  --progress-interval=N   seconds (default 10, 0 disables)\n";
+                         "  --progress-interval=N   seconds (default 10, 0 disables)\n"
+                         "  --mixed-reads=N / --mixed-writes=N / --mixed-deletes=N\n"
+                         "                          if any nonzero, replaces the standalone --reads\n"
+                         "                          phase with one combined phase of genuinely\n"
+                         "                          interleaved GET/PUT/DELETE across all worker\n"
+                         "                          threads (see kv_benchmark --help for the full\n"
+                         "                          rationale -- identical design here). Default 0/0/0.\n"
+                         "  --drop-caches-before-read  drop the VM host's OS page cache before the\n"
+                         "                          read/mixed phase, so it measures cold reads (see\n"
+                         "                          kv_benchmark --help for why this matters far more\n"
+                         "                          than generation count/compaction). Default: off.\n";
             std::exit(0);
         }
     }
@@ -290,16 +318,131 @@ ReadResult run_read_phase(const BenchConfig& cfg) {
     return r;
 }
 
+struct MixedResult {
+    double seconds = 0.0;
+    size_t get_ops = 0, get_hits = 0, get_misses = 0;
+    size_t put_ops = 0, put_updates = 0, put_new_keys = 0;
+    size_t delete_ops = 0;
+};
+
+// Mirrors kv_benchmark.cpp's run_mixed_phase exactly (same budget-based
+// interleaving, same ~50/50 update/new-key split, same key distributions)
+// but sends real wire-protocol requests to the leader instead of calling a
+// local StorageEngine -- see that function's comment for the full design
+// rationale, including why there's no pre-built op plan at this scale and
+// why hit/miss counts aren't bit-for-bit reproducible run to run here.
+MixedResult run_mixed_phase(const BenchConfig& cfg) {
+    std::atomic<int64_t> reads_remaining{static_cast<int64_t>(cfg.mixed_reads)};
+    std::atomic<int64_t> writes_remaining{static_cast<int64_t>(cfg.mixed_writes)};
+    std::atomic<int64_t> deletes_remaining{static_cast<int64_t>(cfg.mixed_deletes)};
+    std::atomic<uint64_t> next_new_key{cfg.writes};
+
+    std::atomic<size_t> get_ops{0}, get_hits{0}, get_misses{0};
+    std::atomic<size_t> put_ops{0}, put_updates{0}, put_new_keys{0};
+    std::atomic<size_t> delete_ops{0};
+    std::atomic<size_t> done{0};
+    size_t total_ops = cfg.mixed_reads + cfg.mixed_writes + cfg.mixed_deletes;
+
+    std::vector<std::thread> workers;
+    auto t0 = std::chrono::steady_clock::now();
+    {
+        ProgressReporter progress("mixed", done, total_ops, cfg.progress_interval);
+        for (unsigned t = 0; t < cfg.threads; ++t) {
+            workers.emplace_back([&, t] {
+                TcpSocket sock = connect_or_die(cfg);
+                std::mt19937_64 rng(5000 + t);
+                std::uniform_real_distribution<double> unit(0.0, 1.0);
+                std::uniform_int_distribution<size_t> hit_dist(0, cfg.writes == 0 ? 0 : cfg.writes - 1);
+                std::uniform_int_distribution<size_t> miss_dist(
+                    0, cfg.mixed_reads == 0 ? 0 : cfg.mixed_reads - 1);
+
+                size_t local_get = 0, local_hit = 0, local_miss = 0;
+                size_t local_put = 0, local_update = 0, local_new = 0;
+                size_t local_delete = 0, local_done = 0;
+
+                while (true) {
+                    int64_t r = std::max<int64_t>(reads_remaining.load(std::memory_order_relaxed), 0);
+                    int64_t w = std::max<int64_t>(writes_remaining.load(std::memory_order_relaxed), 0);
+                    int64_t d = std::max<int64_t>(deletes_remaining.load(std::memory_order_relaxed), 0);
+                    int64_t total = r + w + d;
+                    if (total <= 0) break;
+
+                    uint64_t roll = std::uniform_int_distribution<uint64_t>(
+                        0, static_cast<uint64_t>(total) - 1)(rng);
+
+                    if (roll < static_cast<uint64_t>(r)) {
+                        if (reads_remaining.fetch_sub(1, std::memory_order_relaxed) <= 0) {
+                            reads_remaining.fetch_add(1, std::memory_order_relaxed);
+                            continue;
+                        }
+                        bool miss = unit(rng) < cfg.miss_rate;
+                        std::string key = miss ? miss_key(miss_dist(rng)) : hit_key(hit_dist(rng));
+                        sock.send_all(encode_get_request(key));
+                        auto msg = receive_message(sock);
+                        auto* resp = msg ? std::get_if<GetResponse>(&*msg) : nullptr;
+                        if (resp && resp->found) ++local_hit; else ++local_miss;
+                        ++local_get;
+                    } else if (roll < static_cast<uint64_t>(r) + static_cast<uint64_t>(w)) {
+                        if (writes_remaining.fetch_sub(1, std::memory_order_relaxed) <= 0) {
+                            writes_remaining.fetch_add(1, std::memory_order_relaxed);
+                            continue;
+                        }
+                        bool is_new = unit(rng) < 0.5;
+                        size_t idx = is_new ? next_new_key.fetch_add(1, std::memory_order_relaxed)
+                                             : hit_dist(rng);
+                        std::string value = make_value(cfg.min_value_size, cfg.max_value_size, rng);
+                        sock.send_all(encode_put_request(hit_key(idx), value));
+                        receive_message(sock);
+                        if (is_new) ++local_new; else ++local_update;
+                        ++local_put;
+                    } else {
+                        if (deletes_remaining.fetch_sub(1, std::memory_order_relaxed) <= 0) {
+                            deletes_remaining.fetch_add(1, std::memory_order_relaxed);
+                            continue;
+                        }
+                        sock.send_all(encode_delete_request(hit_key(hit_dist(rng))));
+                        receive_message(sock);
+                        ++local_delete;
+                    }
+                    if (++local_done % 1000 == 0) done += 1000;
+                }
+
+                done += local_done % 1000;
+                get_ops += local_get; get_hits += local_hit; get_misses += local_miss;
+                put_ops += local_put; put_updates += local_update; put_new_keys += local_new;
+                delete_ops += local_delete;
+            });
+        }
+        for (auto& w : workers) w.join();
+    }
+    auto t1 = std::chrono::steady_clock::now();
+
+    MixedResult res;
+    res.seconds = std::chrono::duration<double>(t1 - t0).count();
+    res.get_ops = get_ops.load(); res.get_hits = get_hits.load(); res.get_misses = get_misses.load();
+    res.put_ops = put_ops.load(); res.put_updates = put_updates.load(); res.put_new_keys = put_new_keys.load();
+    res.delete_ops = delete_ops.load();
+    return res;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     BenchConfig cfg = parse_args(argc, argv);
 
+    bool mixed_mode = cfg.mixed_reads > 0 || cfg.mixed_writes > 0 || cfg.mixed_deletes > 0;
+
     std::cout << "=== cluster_benchmark ===\n"
               << "leader=" << cfg.leader_host << ":" << cfg.leader_port
               << " writes=" << cfg.writes << " deletes=" << cfg.deletes << " reads=" << cfg.reads
               << " value_size=[" << cfg.min_value_size << "-" << cfg.max_value_size << "]B"
-              << " miss_rate=" << cfg.miss_rate << " threads=" << cfg.threads << "\n\n";
+              << " miss_rate=" << cfg.miss_rate << " threads=" << cfg.threads;
+    if (mixed_mode) {
+        std::cout << " mixed_reads=" << cfg.mixed_reads
+                   << " mixed_writes=" << cfg.mixed_writes
+                   << " mixed_deletes=" << cfg.mixed_deletes;
+    }
+    std::cout << "\n\n";
 
     double write_seconds = run_write_phase(cfg);
     double wps = write_seconds > 0.0 ? static_cast<double>(cfg.writes) / write_seconds : 0.0;
@@ -310,10 +453,6 @@ int main(int argc, char** argv) {
     }
     double dps = dr.seconds > 0.0 ? static_cast<double>(dr.ops) / dr.seconds : 0.0;
 
-    ReadResult rr = run_read_phase(cfg);
-    double rps = rr.seconds > 0.0 ? static_cast<double>(cfg.reads) / rr.seconds : 0.0;
-    double observed_miss_rate = cfg.reads > 0 ? static_cast<double>(rr.misses) / static_cast<double>(cfg.reads) : 0.0;
-
     std::cout << "--- Results ---\n";
     std::cout << "WRITE_OPS=" << cfg.writes << "\n";
     std::cout << "WRITE_SECONDS=" << write_seconds << "\n";
@@ -321,12 +460,43 @@ int main(int argc, char** argv) {
     std::cout << "DELETE_OPS=" << dr.ops << "\n";
     std::cout << "DELETE_SECONDS=" << dr.seconds << "\n";
     std::cout << "DPS=" << dps << "\n";
-    std::cout << "READ_OPS=" << cfg.reads << "\n";
-    std::cout << "READ_SECONDS=" << rr.seconds << "\n";
-    std::cout << "RPS=" << rps << "\n";
-    std::cout << "READ_MISS_RATE_REQUESTED=" << cfg.miss_rate << "\n";
-    std::cout << "READ_MISS_RATE_OBSERVED=" << observed_miss_rate << "\n";
-    std::cout << "READ_HITS=" << rr.hits << "\n";
-    std::cout << "READ_MISSES=" << rr.misses << "\n";
+
+    if (cfg.drop_caches_before_read) {
+        std::cout << "--- Dropping OS page cache before read/mixed phase ---" << std::endl;
+        int rc = std::system("sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null");
+        std::cout << "--- drop_caches exit code: " << rc << " ---" << std::endl;
+    }
+
+    if (mixed_mode) {
+        MixedResult mr = run_mixed_phase(cfg);
+        size_t mixed_total_ops = mr.get_ops + mr.put_ops + mr.delete_ops;
+        double mixed_ops_per_sec = mr.seconds > 0.0
+            ? static_cast<double>(mixed_total_ops) / mr.seconds : 0.0;
+        double mixed_get_miss_rate = mr.get_ops > 0
+            ? static_cast<double>(mr.get_misses) / static_cast<double>(mr.get_ops) : 0.0;
+        std::cout << "MIXED_SECONDS=" << mr.seconds << "\n";
+        std::cout << "MIXED_TOTAL_OPS=" << mixed_total_ops << "\n";
+        std::cout << "MIXED_OPS_PER_SEC=" << mixed_ops_per_sec << "\n";
+        std::cout << "MIXED_GET_OPS=" << mr.get_ops << "\n";
+        std::cout << "MIXED_GET_HITS=" << mr.get_hits << "\n";
+        std::cout << "MIXED_GET_MISSES=" << mr.get_misses << "\n";
+        std::cout << "MIXED_GET_MISS_RATE_OBSERVED=" << mixed_get_miss_rate << "\n";
+        std::cout << "MIXED_PUT_OPS=" << mr.put_ops << "\n";
+        std::cout << "MIXED_PUT_UPDATES=" << mr.put_updates << "\n";
+        std::cout << "MIXED_PUT_NEW_KEYS=" << mr.put_new_keys << "\n";
+        std::cout << "MIXED_DELETE_OPS=" << mr.delete_ops << "\n";
+    } else {
+        ReadResult rr = run_read_phase(cfg);
+        double rps = rr.seconds > 0.0 ? static_cast<double>(cfg.reads) / rr.seconds : 0.0;
+        double observed_miss_rate = cfg.reads > 0
+            ? static_cast<double>(rr.misses) / static_cast<double>(cfg.reads) : 0.0;
+        std::cout << "READ_OPS=" << cfg.reads << "\n";
+        std::cout << "READ_SECONDS=" << rr.seconds << "\n";
+        std::cout << "RPS=" << rps << "\n";
+        std::cout << "READ_MISS_RATE_REQUESTED=" << cfg.miss_rate << "\n";
+        std::cout << "READ_MISS_RATE_OBSERVED=" << observed_miss_rate << "\n";
+        std::cout << "READ_HITS=" << rr.hits << "\n";
+        std::cout << "READ_MISSES=" << rr.misses << "\n";
+    }
     return 0;
 }
