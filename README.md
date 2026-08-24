@@ -36,7 +36,8 @@ which comfortably fits in page cache and doesn't stress anything. Latency = `thr
 | Stage | WPS | DPS | RPS | Write latency | Delete latency | Read latency |
 |---|---|---|---|---|---|---|
 | **Single-node** (Phase 5, with Bloom filters) | 11,494.5 | 181,539.8 | 4,412.24 | 348.0us | 22.0us | 906.6us |
-| **Multi-node** (Phase 7, 3-node sharded cluster) | 11,072.4 | 23,596.7 | **4,754.23** | 361.3us | 169.5us | **841.4us** |
+| **Multi-node** (Phase 7, 3-node sharded cluster) | 11,072.4 | 23,596.7 | 4,754.23 | 361.3us | 169.5us | 841.4us |
+| **Single-node + compaction** (Phase 5, background compaction) | **16,405** | **245,935** | **337,399** | 243.8us | 16.3us | **11.9us** |
 
 **What this shows:** sharding helps the workload it was actually built for. The single-node run puts
 all 3,000,000 keys through one `StorageEngine` (33 SSTable generations, ~18GB); the multi-node run
@@ -65,8 +66,38 @@ Reproduce: `docker compose up --build -d` (3 compute nodes, `MEMTABLE_THRESHOLD=
 `./scripts/run_benchmark_docker_biggest.sh` (see "Benchmarking (Docker)" below for full methodology
 and prior scenarios).
 
-_Next row goes here once compaction (Phase 5, next up) lands -- re-run both single-node and
-multi-node identically and add a new pair of rows, not a new section._
+**Compaction changes the picture dramatically for reads.** Re-running the identical "biggest"
+scenario with background compaction enabled (`kv_benchmark --enable-compaction`, merging the two
+globally-oldest SSTable generations at a time -- see Phase 5 in the Roadmap below for the full
+design) pushed RPS from 4,412 to **337,399 -- a ~76.5x improvement** -- while writes and deletes also
+improved measurably (WPS +42.7%, DPS +35.5%). The mechanism: instead of 33 separate generations each
+needing its own Bloom-filter check and potential file open, most of the historical dataset ends up
+concentrated into one large merged file (capped around ~895MB by the size-ratio gate described
+below), so a typical lookup touches at most a couple of files instead of dozens.
+
+This required a real fix along the way, not a clean first pass, worth documenting honestly: the
+initial "always merge the two globally-oldest generations" design caused runaway write
+amplification -- the oldest surviving file becomes an ever-growing accumulator that gets fully
+re-read and re-written on *every* subsequent pass just to fold in one more freshly-flushed
+generation. Caught live on the VM, not assumed away: the accumulator reached 6.3GB mid-merge with a
+4.8GB+ temp file in flight, having already performed ~93GB of writes and ~94GB of reads against an
+~18GB logical dataset -- what looked like a hung benchmark process was actually
+`StopBackgroundCompaction()` correctly blocking in `join()` on that one gigantic merge. Fixed with a
+size-ratio gate (`kMaxOlderToNewerSizeRatio = 4.0` in `storage_engine.cpp`): skip merging the two
+oldest once the older file's size already exceeds 4x the newer one's, bounding the worst-case
+single-merge cost instead of merging unconditionally. This does mean a given pair can permanently
+stop making progress once the ratio is crossed -- a real limit of "always merge oldest two" as a
+strategy, not something a ratio alone fully solves. True size-tiered compaction (letting smaller,
+newer generations merge among themselves first, promoting to a larger tier only once there's a
+comparably-sized batch) would do better -- noted as a real follow-up, not yet implemented.
+
+Reproduce: `./build/kv_benchmark --writes=3000000 --deletes=300000 --reads=10000000
+--min-value-size=512 --max-value-size=4096 --memtable-threshold=100000 --threads=4
+--enable-compaction`.
+
+_Next row goes here once the distributed cluster is re-run with compaction enabled on each compute
+node (`ENABLE_COMPACTION=1` / `--enable-compaction`), or once size-tiered compaction replaces the
+simple size-ratio gate -- add a new row, not a new section._
 
 ---
 
@@ -291,7 +322,7 @@ real comparable-scale result: see "📈 Performance Results" above.
 
 ### Phase 5: Optimization & Efficiency
 * [x] **Bloom Filters:** One filter per SSTable (`include/engine/bloom_filter.h`, `src/bloom_filter.cpp`), built at flush/load time alongside the existing index and consulted in `Get` before `std::ifstream::open()`, so a `Get` can skip opening a file entirely when the filter proves the key definitely isn't in it. 5 hash probes per key (Kirsch-Mitzenmacher double-hashing: two FNV-1a hashes combined as `h1 + i*h2 mod m`, standard practice in production Bloom filters -- provably as effective as 5 genuinely independent hash functions without paying for 5 separate hash computations), 10 bits/key, landing at the standard ~1% false-positive-rate ballpark (~0.94% analytically; **0.60% measured** on a 100,000-key sample -- see `tests/test_bloom_filter.cpp`). Correctness-checked two ways: 5 dedicated unit tests (no false negatives -- a hard guarantee, checked exactly, not sampled; false-positive rate stays well under a generous bound; sizing) plus the full existing suite (36/36 checks) passing unmodified through the public `StorageEngine` API. **Perf-validated at scale, and the result is a genuinely useful negative one:** re-running the 33-generation "biggest" benchmark identically showed RPS/WPS essentially unchanged (~4,412 vs ~4,419 RPS, well within noise) -- see the "Bloom filter re-run" writeup in the Benchmarking section below for the full numbers and why. It disproves this project's original (inferred, never directly measured) assumption that `open()` call count was the dominant per-lookup cost at scale; the real cost is disk I/O for the reads that remain necessary, which a Bloom filter can reduce the *count* of but not the *volume* of. Kept in the codebase because it's still theoretically correct and cheap (and would matter more at smaller scale, or with a colder file-open path than this Linux/Docker environment has), but it's not what actually moves the needle here -- that's the evidence behind moving toward sharding across multiple nodes instead of further single-node read-path optimization.
-* [ ] **Compaction (L0 -> L1):** A background (or on-demand) worker that merges multiple SSTable generations into fewer, larger ones -- discarding obsolete versions of overwritten keys and dropping tombstones once nothing older they'd shadow remains. Two things to get right: (1) **locking** -- compaction mutates the same `sstable_files` list and `index_cache` that `Get` reads under `shared_lock`, so a merge needs to build the new merged file(s) *off to the side* first and only take the `unique_lock` for the brief pointer-swap that atomically replaces the old generation list with the new one, rather than holding a write lock for the whole (potentially slow) merge; (2) it directly fixes two things this session's benchmarking exposed as real, not theoretical, problems: generation count growing unboundedly (currently the only way to keep it bounded is choosing a big `memtable-threshold` up front) and stale WAL segments never being cleaned up after their generation flushes (roughly doubles on-disk footprint today -- see the sizing math in `src/benchmark.cpp`).
+* [x] **Compaction:** A background thread (`StorageEngine::StartBackgroundCompaction`, opt-in via `--enable-compaction`/`ENABLE_COMPACTION`) that repeatedly merges the two globally-oldest surviving SSTable generations into one -- never the newest -- discarding obsolete overwritten values and dropping tombstones (safe because nothing older than the oldest pair ever survives to still need shadowing). **Lock-free merge:** SSTables are immutable once written, so the slow part (read both files, merge, write the new one) holds no lock at all; only a brief final metadata swap takes the same `rw_lock` `Put`/`Get`/`Delete` already use -- no per-file locks, no abort/retry needed, since nothing slow ever blocks a reader. Ordering is tracked positionally (vector index), not by filename, so a merged file can get a fresh collision-free sequence number while staying logically oldest; `Manifest::rewrite()` (new: atomic temp-file+rename) durably commits the swap. **Perf-validated at the real "biggest" scale, and the result is dramatic:** see "📈 Performance Results" above -- RPS went from 4,412 to **337,399 (~76.5x)**, WPS +42.7%, DPS +35.5%. **A real efficiency bug found and fixed along the way, not assumed away:** merging "always the two oldest" unconditionally makes the oldest survivor an ever-growing accumulator, fully re-read and re-written on every pass -- caught live at a 6.3GB accumulator mid-merge (~93GB of cumulative write I/O against an ~18GB dataset) before it was fixed with a size-ratio gate (skip the pair once the older file exceeds 4x the newer one's size). This bounds the worst case but means a pair can permanently stop progressing once the ratio is crossed -- true size-tiered compaction (merging smaller, newer generations among themselves first) would do better and is a real follow-up, not yet implemented. Also fixes the generation-count-growing-unboundedly problem this session's earlier benchmarking exposed. Separately noted, still open: stale WAL segments are still never cleaned up after their generation flushes (unrelated to compaction, since a segment becomes redundant the moment its own flush succeeds, not just after a later merge).
 * [ ] **Cold-cache benchmarking:** The Linux/Docker RPS numbers in the "Benchmarking" section above all reflect a warm OS page cache (reads immediately follow the write phase that produced the same dataset). Get a genuine cold-cache number too -- e.g. drop caches between phases, or read data written by a prior, separate `docker run` -- for a fuller "worst case" picture alongside the current "best case" numbers.
 
 ### Phase 6: Advanced Features
