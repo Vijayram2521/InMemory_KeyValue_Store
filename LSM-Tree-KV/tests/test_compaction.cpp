@@ -193,7 +193,43 @@ void kv_tests::run_test_compaction() {
                                "(would fail if the new generation silently overwrote a compacted file)");
     }
 
-    // 6. Concurrent Get() during CompactOnce(): smoke test, not a precise
+    // 6. Size-ratio gate: once the older generation already dwarfs the
+    // newer one, CompactOnce() must skip the pair rather than re-merge an
+    // ever-growing accumulator (the exact runaway write-amplification
+    // problem this gate exists to prevent).
+    {
+        std::string path = "./TestStorage/test_compaction_size_gate";
+        cleanup_test_dir(path);
+        // A high memtable_threshold so all 500 puts below land in ONE
+        // generation instead of auto-flushing every 5 (the engine's tiny
+        // unit-test default) into ~100 small ones.
+        kv_engine::StorageEngine engine(path, /*memtable_threshold=*/1000);
+
+        // Generation 0: large -- many keys with sizeable values.
+        for (int i = 0; i < 500; ++i) {
+            engine.Put("big" + std::to_string(i), std::string(2000, 'z'));
+        }
+        engine.ForceFlush();
+        // Generation 1: tiny by comparison.
+        engine.Put("small", "x");
+        engine.ForceFlush();
+        // Generation 2: untouched newest.
+        engine.Put("sentinel", "y");
+        engine.ForceFlush();
+
+        KV_CHECK_EQ(size_t(3), count_sst_files(path), "3 generations exist before compaction is attempted");
+        KV_CHECK_FALSE(engine.CompactOnce(),
+                        "CompactOnce skips a pair once the older file's size dwarfs the newer one");
+        KV_CHECK_EQ(size_t(3), count_sst_files(path),
+                    "File count is unchanged -- the oversized pair was left alone, not merged");
+
+        auto big0 = engine.Get("big0");
+        KV_CHECK(big0.has_value() && big0->size() == 2000, "Data in the untouched large generation still reads correctly");
+        auto small = engine.Get("small");
+        KV_CHECK(small.has_value() && *small == "x", "Data in the untouched small generation still reads correctly");
+    }
+
+    // 7. Concurrent Get() during CompactOnce(): smoke test, not a precise
     // timing assertion -- just proving no crash/deadlock and no missed
     // reads while compaction runs.
     {

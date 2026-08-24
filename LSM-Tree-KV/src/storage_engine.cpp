@@ -35,6 +35,22 @@ uint64_t parse_seq_from_path(const std::string& path) {
     return std::stoull(std::filesystem::path(path).stem().string());
 }
 
+// Without this gate, "always merge the two oldest" makes the oldest
+// surviving file an ever-growing accumulator that gets fully re-read and
+// re-written on EVERY subsequent pass just to fold in one more
+// freshly-flushed generation -- observed in practice under sustained write
+// load to reach multiple GB and tens of GB of cumulative compaction I/O,
+// far more than the logical dataset size. Once the older file already
+// dwarfs the newer one, merging them again mostly just re-copies bytes
+// that were already merged last time -- skip that pass rather than pay the
+// cost again. This does mean compaction can permanently stop making
+// progress on a given pair once the ratio is crossed -- a real limit of
+// "always merge oldest two" as a strategy, not something a ratio alone
+// fully solves; true size-tiered compaction would let smaller, newer
+// generations merge among themselves first instead. Noted as a real
+// follow-up, not implemented here -- this bounds the worst case instead.
+constexpr double kMaxOlderToNewerSizeRatio = 4.0;
+
 // Builds a Bloom filter sized for `index`'s key count and populated with
 // every key in it. Used both for freshly-flushed generations (which already
 // have their index in hand) and for generations recovered via the Manifest
@@ -180,6 +196,19 @@ struct StorageEngine::Impl {
             if (sstable_files.size() < 3) return false;
             path_a = sstable_files[0]; // older
             path_b = sstable_files[1]; // newer
+        }
+
+        // Size-ratio gate -- see kMaxOlderToNewerSizeRatio's comment above.
+        // Cheap (just two stat() calls), so fine to redo every pass even
+        // though the answer won't change until something else merges.
+        {
+            std::error_code ec_a, ec_b;
+            uint64_t size_a = std::filesystem::file_size(path_a, ec_a);
+            uint64_t size_b = std::filesystem::file_size(path_b, ec_b);
+            if (!ec_a && !ec_b && size_b > 0 &&
+                static_cast<double>(size_a) > kMaxOlderToNewerSizeRatio * static_cast<double>(size_b)) {
+                return false;
+            }
         }
 
         // --- Slow phase: no lock held ---
