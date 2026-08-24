@@ -42,6 +42,67 @@ namespace {
     uint64_t delete_record_size(const std::string& key) {
         return 1 + sizeof(uint32_t) + key.size();
     }
+
+    // Forward-only cursor over one SSTable's data block, decoding and
+    // holding exactly one record at a time -- used by merge_files() so
+    // compaction's peak memory is O(1) per input file instead of O(file
+    // size). Materializing whole files (the original approach) is fine on
+    // an unconstrained dev machine but genuinely OOM-kills a
+    // memory-capped deployment (observed directly: 1.2GB-limited compute
+    // node containers killed by the kernel cgroup OOM killer while holding
+    // two full files' records plus a merged copy simultaneously).
+    class RecordCursor {
+    public:
+        explicit RecordCursor(const std::string& filename) : ifs_(filename, std::ios::binary) {
+            if (!ifs_.is_open()) { valid_ = false; return; }
+            ifs_.seekg(0, std::ios::end);
+            std::streamoff file_size = ifs_.tellg();
+            if (file_size < static_cast<std::streamoff>(kFooterSize)) { valid_ = false; return; }
+            ifs_.seekg(file_size - static_cast<std::streamoff>(kFooterSize));
+            uint64_t index_offset = 0, index_count = 0;
+            uint32_t magic = 0;
+            if (!ifs_.read(reinterpret_cast<char*>(&index_offset), sizeof(index_offset))) { valid_ = false; return; }
+            if (!ifs_.read(reinterpret_cast<char*>(&index_count), sizeof(index_count))) { valid_ = false; return; }
+            if (!ifs_.read(reinterpret_cast<char*>(&magic), sizeof(magic))) { valid_ = false; return; }
+            if (magic != static_cast<uint32_t>(kSSTableMagic)) { valid_ = false; return; }
+            data_end_ = index_offset;
+            ifs_.seekg(0, std::ios::beg);
+            advance(); // load the first record into current_, if any
+        }
+
+        bool has_current() const { return has_current_; }
+        const Record& current() const { return current_; }
+
+        void advance() {
+            has_current_ = false;
+            if (!valid_ || static_cast<uint64_t>(ifs_.tellg()) >= data_end_) return;
+            char type_raw;
+            if (!ifs_.read(&type_raw, 1)) return;
+            uint8_t type = static_cast<uint8_t>(type_raw);
+            uint32_t kLen = 0;
+            if (!ifs_.read(reinterpret_cast<char*>(&kLen), sizeof(kLen))) return;
+            std::string key(kLen, '\0');
+            if (kLen > 0 && !ifs_.read(&key[0], kLen)) return;
+            if (type == 2) { // DELETE / tombstone -- no value bytes follow
+                current_ = {std::move(key), "", true};
+                has_current_ = true;
+                return;
+            }
+            uint32_t vLen = 0;
+            if (!ifs_.read(reinterpret_cast<char*>(&vLen), sizeof(vLen))) return;
+            std::string value(vLen, '\0');
+            if (vLen > 0 && !ifs_.read(&value[0], vLen)) return;
+            current_ = {std::move(key), std::move(value), false};
+            has_current_ = true;
+        }
+
+    private:
+        std::ifstream ifs_;
+        bool valid_ = true;
+        uint64_t data_end_ = 0;
+        bool has_current_ = false;
+        Record current_;
+    };
 } // namespace
 
 bool SSTable::write_file(const std::string& filename,
@@ -134,49 +195,58 @@ std::vector<IndexEntry> SSTable::load_index(const std::string& filename) {
     return index;
 }
 
-std::vector<Record> SSTable::read_all(const std::string& filename) {
-    std::vector<Record> records;
-    std::ifstream ifs(filename, std::ios::binary);
-    if (!ifs.is_open()) return records;
+bool SSTable::merge_files(const std::string& older_path, const std::string& newer_path,
+                           const std::string& output_path, std::vector<IndexEntry>& out_index) {
+    RecordCursor older(older_path);
+    RecordCursor newer(newer_path);
 
-    ifs.seekg(0, std::ios::end);
-    std::streamoff file_size = ifs.tellg();
-    if (file_size < static_cast<std::streamoff>(kFooterSize)) return records;
+    std::ofstream ofs(output_path, std::ios::binary);
+    if (!ofs.is_open()) return false;
 
-    ifs.seekg(file_size - static_cast<std::streamoff>(kFooterSize));
-    uint64_t index_offset = 0, index_count = 0;
-    uint32_t magic = 0;
-    if (!ifs.read(reinterpret_cast<char*>(&index_offset), sizeof(index_offset))) return records;
-    if (!ifs.read(reinterpret_cast<char*>(&index_count), sizeof(index_count))) return records;
-    if (!ifs.read(reinterpret_cast<char*>(&magic), sizeof(magic))) return records;
-    if (magic != static_cast<uint32_t>(kSSTableMagic)) return records;
+    out_index.clear();
+    uint64_t offset = 0;
 
-    // Data block is a single ascending-key sequence from offset 0 up to
-    // index_offset -- read it sequentially rather than seeking per record,
-    // since each record starts exactly where the previous one ended.
-    ifs.seekg(0, std::ios::beg);
-    while (static_cast<uint64_t>(ifs.tellg()) < index_offset) {
-        char type_raw;
-        if (!ifs.read(&type_raw, 1)) break;
-        uint8_t type = static_cast<uint8_t>(type_raw);
+    // Same merge rule as a two-way sorted merge, applied to two STREAMS
+    // instead of two in-memory containers: on equal keys, `newer` wins;
+    // whichever is smaller advances alone otherwise. A winning tombstone is
+    // dropped entirely (never written) -- correct only when nothing older
+    // than `older_path` survives, which callers (StorageEngine's
+    // compactor) must guarantee by always merging the two globally-oldest
+    // generations.
+    while (older.has_current() || newer.has_current()) {
+        bool same_key = older.has_current() && newer.has_current() &&
+                         older.current().key == newer.current().key;
+        bool pick_newer = same_key ||
+            (newer.has_current() && (!older.has_current() || newer.current().key < older.current().key));
 
-        uint32_t kLen = 0;
-        if (!ifs.read(reinterpret_cast<char*>(&kLen), sizeof(kLen))) break;
-        std::string key(kLen, '\0');
-        if (kLen > 0 && !ifs.read(&key[0], kLen)) break;
-
-        if (type == 2) { // DELETE / tombstone -- no value bytes follow
-            records.push_back({std::move(key), "", true});
-            continue;
+        const Record& winner = pick_newer ? newer.current() : older.current();
+        if (!winner.is_tombstone) {
+            out_index.push_back({winner.key, offset});
+            write_put_record(ofs, winner.key, winner.value);
+            offset += put_record_size(winner.key, winner.value);
         }
 
-        uint32_t vLen = 0;
-        if (!ifs.read(reinterpret_cast<char*>(&vLen), sizeof(vLen))) break;
-        std::string value(vLen, '\0');
-        if (vLen > 0 && !ifs.read(&value[0], vLen)) break;
-        records.push_back({std::move(key), std::move(value), false});
+        if (same_key) { older.advance(); newer.advance(); }
+        else if (pick_newer) { newer.advance(); }
+        else { older.advance(); }
     }
-    return records;
+
+    uint64_t index_offset = offset;
+    for (const auto& entry : out_index) {
+        uint32_t kLen = static_cast<uint32_t>(entry.key.size());
+        ofs.write(reinterpret_cast<const char*>(&kLen), sizeof(kLen));
+        ofs.write(entry.key.data(), kLen);
+        ofs.write(reinterpret_cast<const char*>(&entry.offset), sizeof(entry.offset));
+    }
+
+    uint64_t index_count = out_index.size();
+    uint32_t magic = static_cast<uint32_t>(kSSTableMagic);
+    ofs.write(reinterpret_cast<const char*>(&index_offset), sizeof(index_offset));
+    ofs.write(reinterpret_cast<const char*>(&index_count), sizeof(index_count));
+    ofs.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
+
+    ofs.close();
+    return true;
 }
 
 SearchResult SSTable::search_with_index(const std::string& filename,

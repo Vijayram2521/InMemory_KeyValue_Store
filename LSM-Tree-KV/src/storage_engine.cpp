@@ -10,7 +10,6 @@
 #include <algorithm>
 #include "engine/sstable.h"
 #include "engine/bloom_filter.h"
-#include "engine/compaction.h"
 #include <set>
 #include <unordered_map>
 #include <chrono>
@@ -212,26 +211,29 @@ struct StorageEngine::Impl {
         }
 
         // --- Slow phase: no lock held ---
-        auto older_records = SSTable::read_all(path_a);
-        auto newer_records = SSTable::read_all(path_b);
-        auto merged = merge_records(older_records, newer_records);
-
+        // Streams one record at a time from each input file rather than
+        // loading either fully into memory (peak memory here is O(1) per
+        // input file, not O(file size)) -- the original load-both-files-
+        // fully approach genuinely OOM-killed memory-constrained deployments
+        // (observed directly: 1.2GB-capped compute node containers killed
+        // by the kernel cgroup OOM killer while holding two full files'
+        // records plus a merged copy simultaneously).
         std::string tmp_path = (std::filesystem::path(data_dir) / "compact.tmp").string();
         std::vector<IndexEntry> merged_index;
-        bool wrote_file = false;
-        if (!merged.empty()) {
-            std::set<std::string> no_tombstones; // tombstones are always dropped by merge_records
-            wrote_file = SSTable::write_file(tmp_path, merged, no_tombstones, merged_index);
-            if (!wrote_file) {
-                // Couldn't write the merged file -- abort without touching
-                // any live state. Old generations are untouched; try again
-                // on the next pass.
-                return false;
-            }
+        if (!SSTable::merge_files(path_a, path_b, tmp_path, merged_index)) {
+            // Couldn't write the merged file -- abort without touching any
+            // live state. Old generations are untouched; try again on the
+            // next pass.
+            return false;
         }
-        // If merged.empty(), both generations fully cancelled out (every
-        // key ended up deleted or shadowed) -- nothing to write, the pair
-        // just vanishes with no replacement.
+        bool wrote_file = !merged_index.empty();
+        if (!wrote_file) {
+            // Both generations fully cancelled out (every key ended up
+            // deleted or shadowed) -- discard the empty temp file rather
+            // than registering a pointless empty generation; the pair just
+            // vanishes with no replacement.
+            std::filesystem::remove(tmp_path);
+        }
 
         // --- Swap phase: brief unique_lock for in-memory + Manifest only ---
         std::unique_lock lock(rw_lock);

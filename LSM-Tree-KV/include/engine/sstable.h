@@ -22,9 +22,7 @@ namespace kv_engine {
         uint64_t offset = 0;
     };
 
-    // One decoded data-block record, as returned by read_all -- used by
-    // compaction, which needs full record content (not just key+offset) to
-    // merge two SSTables' data.
+    // One decoded data-block record -- used internally by merge_files.
     struct Record {
         std::string key;
         std::string value;
@@ -61,14 +59,21 @@ namespace kv_engine {
         // this format (footer magic mismatch).
         static std::vector<IndexEntry> load_index(const std::string& filename);
 
-        // Reads the footer to find where the data block ends, then
-        // sequentially decodes every PUT/DELETE record from the start of
-        // the file up to that point, in the same ascending-key order they
-        // were written in. Used by compaction, which needs full record
-        // content (not just key+offset) to merge two SSTables. Returns an
-        // empty vector under the same conditions load_index does (missing,
-        // empty, or non-matching-magic file).
-        static std::vector<Record> read_all(const std::string& filename);
+        // Merges two SSTables (older_path strictly precedes newer_path in
+        // generation order) into a single sorted output file at
+        // output_path, streaming one record at a time from each input
+        // rather than loading either file fully into memory -- peak memory
+        // is O(1) per input file, not O(file size), which matters on
+        // memory-constrained deployments where large accumulator files
+        // previously caused OOM kills. On a key present in both inputs,
+        // the newer_path version wins; a winning tombstone is dropped
+        // entirely (never written to the output) rather than carried
+        // forward -- only correct when nothing older than older_path
+        // survives, which the caller (StorageEngine's compactor) must
+        // guarantee. On success, out_index receives the index built while
+        // writing, same convention as write_file.
+        static bool merge_files(const std::string& older_path, const std::string& newer_path,
+                                 const std::string& output_path, std::vector<IndexEntry>& out_index);
 
         // Binary searches the (already sorted) `index` for `key`. On a
         // match, seeks straight to its byte offset and reads that one

@@ -26,7 +26,6 @@ add_library(
     src/manifest.cpp
     src/sstable.cpp
     src/bloom_filter.cpp
-    src/compaction.cpp
 )
 target_link_libraries(kv_engine Threads::Threads)
 
