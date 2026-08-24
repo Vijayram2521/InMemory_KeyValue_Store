@@ -32,6 +32,11 @@ services:
       # a fair comparison (same per-generation sizing parameter; naturally
       # fewer generations per node purely because each node holds less data).
       MEMTABLE_THRESHOLD: "100000"
+      # Background compaction (merges the two oldest SSTable generations at
+      # a time, size-ratio gated -- see storage_engine.cpp) -- opt-in,
+      # matched to the single-node "biggest + compaction" benchmark row so
+      # the comparison in README.md's Performance Results is apples-to-apples.
+      ENABLE_COMPACTION: "1"
     volumes:
       - compute1_data:/data
 
@@ -45,6 +50,7 @@ services:
       LISTEN_PORT: "7001"
       DATA_DIR: /data
       MEMTABLE_THRESHOLD: "100000"
+      ENABLE_COMPACTION: "1"
     volumes:
       - compute2_data:/data
 
@@ -58,6 +64,7 @@ services:
       LISTEN_PORT: "7001"
       DATA_DIR: /data
       MEMTABLE_THRESHOLD: "100000"
+      ENABLE_COMPACTION: "1"
     volumes:
       - compute3_data:/data
 
