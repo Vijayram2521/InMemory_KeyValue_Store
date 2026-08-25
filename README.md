@@ -27,77 +27,154 @@ sections below cover methodology, bug fixes, and per-scenario detail, but always
 rather than restating figures. Updated as an evolving record each time a change might move the
 needle; older rows stay for reference rather than being overwritten.
 
-All rows below are the *same* workload -- the "biggest" stress scenario: 3,000,000 writes, 300,000
-deletes (10%), then 10,000,000 reads, values 512-4096B (mean ~2304B), `memtable-threshold=100,000`,
-4 client threads, real hardware (Oracle Cloud Ampere A1, ARM64) -- not the smaller "large" scenario,
-which comfortably fits in page cache and doesn't stress anything. Latency = `threads / throughput`
-(4 concurrent threads on both sides), not `1 / throughput`.
+### ⚠️ Methodology correction: page cache dominated the first compaction numbers
 
-| Stage | WPS | DPS | RPS | Write latency | Delete latency | Read latency |
+An earlier version of this section reported compaction improving single-node RPS by ~76.5x
+(4,412 -> 337,399). That number was real but **misleading** -- caught and corrected the same session,
+not silently fixed. Direct investigation (dropping the OS page cache and re-timing 500,000 identical
+reads against the *exact same on-disk dataset*) showed: **105,014 RPS warm, 3,389 RPS cold** -- a
+~31x swing on identical bytes on disk, nothing to do with compaction or generation count. This VM has
+31GB of RAM against a ~7GB "biggest"-scenario dataset, so a read phase immediately following the
+write phase that produced the same data benefits enormously from a page cache that's already warm --
+and once mostly warm, it stops mattering whether the data lives in 2 files or 33. The original
+~4,412 RPS single-node baseline (measured in an earlier session, under undocumented cache
+conditions) turned out not to be reproducible under today's warm-cache conditions either -- re-run
+today it also lands in the tens of thousands of RPS. **Every number below this point was measured
+with the OS page cache explicitly dropped (`sync; echo 3 > /proc/sys/vm/drop_caches`, via the new
+`--drop-caches-before-read` flag) immediately before its read/mixed phase**, so it's cold-started and
+genuinely comparable across rows -- treat this table, not the historical ~4,412/~337,399 figures
+quoted in earlier commits, as authoritative.
+
+One more real workload behavior this surfaced: even cold-started, a sustained 10,000,000-read pass
+over a ~2.7M-key range that fits in RAM **self-warms as it runs** -- the single-node cold-read phase
+measured here starts around ~4,300-4,700 reads/sec (genuinely disk-bound) and accelerates to
+~300,000+ reads/sec by the final interval, as the working set gets pulled into cache by the pass's
+own earlier reads. That's expected and realistic (sustained traffic against data that fits in RAM
+really does behave this way), and it's why the blended full-phase RPS below is much higher than a
+purely-cold number would suggest -- as long as the *same* protocol (drop cache once, then run the
+full phase) is applied to every row, the comparison stays fair.
+
+### Cold-cache-controlled results ("biggest" scenario: 3,000,000 writes, 300,000 deletes,
+10,000,000 reads, values 512-4096B, `memtable-threshold=100,000`, 4 client threads, real hardware --
+Oracle Cloud Ampere A1, ARM64). Latency = `threads / throughput`, not `1 / throughput`.
+
+| Configuration | WPS | DPS | RPS | Write latency | Delete latency | Read latency |
 |---|---|---|---|---|---|---|
-| **Single-node** (Phase 5, with Bloom filters) | 11,494.5 | 181,539.8 | 4,412.24 | 348.0us | 22.0us | 906.6us |
-| **Multi-node** (Phase 7, 3-node sharded cluster) | 11,072.4 | 23,596.7 | 4,754.23 | 361.3us | 169.5us | 841.4us |
-| **Single-node + compaction** (Phase 5, background compaction) | **16,405** | **245,935** | **337,399** | 243.8us | 16.3us | **11.9us** |
+| Single-node, no compaction | 17,515.3 | 244,498 | 55,239.9 | 228.4us | 16.4us | 72.4us |
+| Single-node, **with compaction** | 17,600 | 139,006 | 55,000.5 | 227.3us | 28.8us | 72.7us |
+| Distributed (3 nodes), no compaction | 11,064.5 | 23,826.1 | 4,659.78 | 361.6us | 167.9us | 858.6us |
+| Distributed (3 nodes), **with compaction** | 6,190.06 | 18,807.8 | 4,701.8 | 646.3us | 212.7us | 850.9us |
+| Distributed (2 nodes), **with compaction** | 7,341.93 | 19,135.5 | 4,560.07 | 544.9us | 209.0us | 877.2us |
 
-**What this shows:** sharding helps the workload it was actually built for. The single-node run puts
-all 3,000,000 keys through one `StorageEngine` (33 SSTable generations, ~18GB); the multi-node run
-splits the same 3,000,000 keys across 3 compute nodes via consistent hashing (~1,000,000 keys/node,
-so each node holds a third of the data and proportionally fewer generations). Read throughput went
-up ~7.8% (4,412 -> 4,754 RPS) *despite* paying for two Docker-bridge-network hops per request
-(client -> leader -> compute-node) plus wire-protocol encode/decode on top -- confirming the Bloom
-filter finding further below (Phase 5 in the Roadmap) that per-node disk I/O pressure, not
-`open()`-call count, is the real bottleneck: reducing the data one node has to serve helps, even
-after paying a real network tax. It's a genuine but modest win, not a dramatic one -- 3 nodes doesn't
-mean 3x, because the underlying per-node I/O bottleneck doesn't vanish, there's just less of it per
-node.
+**Finding #1 -- compaction shows no measurable read benefit once cache state is controlled fairly,
+on either architecture.** Single-node: 55,239.9 vs 55,000.5 RPS, a 0.4% difference -- pure noise.
+With 31GB of RAM against a ~7GB dataset, both scenarios' page cache fully warms during the read
+phase regardless of file layout, so compaction's "fewer files to open" advantage becomes irrelevant
+once the data is just sitting in RAM either way. Distributed: 4,659.78 vs 4,701.8 RPS, also noise
+(+0.9%). This is a real, if humbling, result: compaction's actual value in this codebase is bounding
+disk growth and generation count over time (see the Phase 5 roadmap entry above), not raw read
+throughput -- at least not on hardware with enough spare RAM to make file count irrelevant.
 
-Writes came out roughly flat (11,494 -> 11,072 WPS, -3.7%): each write still serializes through
-exactly one shard's own exclusive lock, so per-shard write cost is unchanged, and throughput here is
-still gated by the benchmark's 4 client threads rather than server capacity. Deletes got measurably
-worse (181,540 -> 23,597 DPS, ~7.7x slower): a delete is nearly free on a single node (WAL append +
-in-memory map update, no value I/O at all), so the ~150-170us network round trip that's a rounding
-error against a ~900us read becomes the dominant cost against an operation that used to take ~22us --
-the network tax is roughly constant per op, so it hurts cheap ops far more than expensive ones.
+**Finding #2 -- compaction actively hurts distributed write throughput, and it's resource
+contention, not the architecture.** WPS dropped 44% (11,064.5 -> 6,190.06) when compaction was
+turned on across all 3 compute nodes. All 4 containers (leader + 3 compute nodes, each running its
+own background compaction thread) share **one VM's** CPU and disk -- there's no isolation between
+them. Inspecting each node's on-disk state after a compaction run confirmed this directly: generation
+convergence was wildly uneven (compute-1 converged to 2 files almost like the single-node case;
+compute-3 was still sitting at 16, barely better than uncompacted) purely because of how CPU/disk
+time happened to be scheduled across the 3 concurrent compaction threads, not anything about the
+keys each node owned.
 
-Reproduce: `docker compose up --build -d` (3 compute nodes, `MEMTABLE_THRESHOLD=100000` set in
-`docker-compose.yml` to match the single-node scenario's own threshold), then
+**Finding #3 -- a 2-node test confirms the contention explanation for writes, and shows reads are a
+genuine tradeoff, not free.** Dropping to 2 compute nodes (same VM, same compaction settings) partially
+recovered write throughput: **WPS 6,190.06 -> 7,341.93 (+18.6%)** with one fewer compaction thread and
+one fewer process competing for the shared VM -- direct evidence the write-side drop is contention,
+not something inherent to sharding or to compaction. Reads did *not* improve the same way
+(RPS 4,701.8 -> 4,560.07, -3.0%, within noise): with 2 nodes each shard holds 1.5x more data
+(~1.5M keys/node instead of ~1M), and that larger per-node working set roughly cancels out the
+benefit of less cross-process contention for the read path specifically. Together, these three
+findings say the same thing from different angles: **on this single shared VM, distributed
+throughput is bottlenecked by contention among co-located processes, not by the sharding design
+itself** -- see "What to expect on real, separately-resourced hardware" below.
+
+Reproduce any row: single-node --
+`./build/kv_benchmark --writes=3000000 --deletes=300000 --reads=10000000 --min-value-size=512
+--max-value-size=4096 --memtable-threshold=100000 --threads=4 --drop-caches-before-read
+[--enable-compaction]`. Distributed --
+`ENABLE_COMPACTION=1 docker compose up --build -d` (or plain `docker compose up --build -d` for the
+no-compaction row; `docker compose -f docker-compose.2node.yml` for the 2-node row), then
 `./build/cluster_benchmark --writes=3000000 --deletes=300000 --reads=10000000 --min-value-size=512
---max-value-size=4096 --threads=4` against the leader's published port. Single-node reproduction:
-`./scripts/run_benchmark_docker_biggest.sh` (see "Benchmarking (Docker)" below for full methodology
-and prior scenarios).
+--max-value-size=4096 --threads=4 --drop-caches-before-read`.
 
-**Compaction changes the picture dramatically for reads.** Re-running the identical "biggest"
-scenario with background compaction enabled (`kv_benchmark --enable-compaction`, merging the two
-globally-oldest SSTable generations at a time -- see Phase 5 in the Roadmap below for the full
-design) pushed RPS from 4,412 to **337,399 -- a ~76.5x improvement** -- while writes and deletes also
-improved measurably (WPS +42.7%, DPS +35.5%). The mechanism: instead of 33 separate generations each
-needing its own Bloom-filter check and potential file open, most of the historical dataset ends up
-concentrated into one large merged file (capped around ~895MB by the size-ratio gate described
-below), so a typical lookup touches at most a couple of files instead of dozens.
+### Mixed workload (compaction only): interleaved reads/writes/deletes at higher scale
 
-This required a real fix along the way, not a clean first pass, worth documenting honestly: the
-initial "always merge the two globally-oldest generations" design caused runaway write
-amplification -- the oldest surviving file becomes an ever-growing accumulator that gets fully
-re-read and re-written on *every* subsequent pass just to fold in one more freshly-flushed
-generation. Caught live on the VM, not assumed away: the accumulator reached 6.3GB mid-merge with a
-4.8GB+ temp file in flight, having already performed ~93GB of writes and ~94GB of reads against an
-~18GB logical dataset -- what looked like a hung benchmark process was actually
-`StopBackgroundCompaction()` correctly blocking in `join()` on that one gigantic merge. Fixed with a
-size-ratio gate (`kMaxOlderToNewerSizeRatio = 4.0` in `storage_engine.cpp`): skip merging the two
-oldest once the older file's size already exceeds 4x the newer one's, bounding the worst-case
-single-merge cost instead of merging unconditionally. This does mean a given pair can permanently
-stop making progress once the ratio is crossed -- a real limit of "always merge oldest two" as a
-strategy, not something a ratio alone fully solves. True size-tiered compaction (letting smaller,
-newer generations merge among themselves first, promoting to a larger tier only once there's a
-comparably-sized batch) would do better -- noted as a real follow-up, not yet implemented.
+A different question from the phased benchmark above: does throughput hold up against a *live,
+concurrently-changing* dataset, not just reads against an already-settled one? After the same
+3,000,000-write/300,000-delete seed, one combined phase runs 50,000,000 reads, 5,000,000 writes
+(~50/50 split between updates to existing keys and brand-new keys extending the keyspace), and
+1,000,000 deletes, all genuinely interleaved across every worker thread (see `run_mixed_phase` in
+`benchmark.cpp`/`cluster_benchmark_main.cpp`) -- not three sequential phases. Run with compaction on
+throughout (`--enable-compaction`, cold-started via `--drop-caches-before-read`); non-compacted
+mixed runs weren't run given Finding #1 above already showed compaction isn't the lever that
+matters here.
 
-Reproduce: `./build/kv_benchmark --writes=3000000 --deletes=300000 --reads=10000000
---min-value-size=512 --max-value-size=4096 --memtable-threshold=100000 --threads=4
---enable-compaction`.
+| Configuration | Mixed ops/sec (56M ops total) | Wall time | GET hit rate | Setup WPS |
+|---|---|---|---|---|
+| Single-node, with compaction | **62,172.8** | 15.0 min | 70.0% (miss rate 29.98%) | 17,598 |
+| Distributed (3 nodes), with compaction | 4,952.45 | 3h 8.5min | 70.0% (miss rate 29.98%) | 6,881.77 |
 
-_Next row goes here once the distributed cluster is re-run with compaction enabled on each compute
-node (`ENABLE_COMPACTION=1` / `--enable-compaction`), or once size-tiered compaction replaces the
-simple size-ratio gate -- add a new row, not a new section._
+Single-node handled the full 56,000,000-op mixed workload in 15 minutes; the distributed cluster took
+over 3 hours for the identical workload -- a ~12.6x gap, wider than the phased benchmark's gap,
+consistent with the same shared-VM contention finding above compounding over a much longer sustained
+run (5,000,000 more writes flowing in throughout, each triggering more flushes and more compaction
+work competing for the same disk). Both runs completed cleanly with correct, internally-consistent
+results (GET/PUT/DELETE op counts summed exactly to the requested totals; the observed 29.98% miss
+rate is the expected 15% guaranteed-miss slice plus the growing fraction of "hit" targets that had
+been deleted by that point in the run, time-averaged across the whole mixed phase). No data-integrity
+issues; the gap is purely a throughput story, not a correctness one.
+
+A real bug surfaced and fixed by this specific test, not assumed away: the first 3-node compacted
+mixed run **OOM-killed 2 of 3 compute node containers** (dmesg confirmed `Killed process ... Memory
+cgroup out of memory`, `docker inspect` showed `OOMKilled=true`), at only generation 3 -- far too
+early for write amplification to be the cause. Root cause: `compact_once()` was loading **both**
+input SSTables' full contents into `std::vector<Record>` simultaneously via `SSTable::read_all()`,
+plus building a third full copy as the merged map -- harmless on this VM's 32GB of unconstrained RAM,
+but genuinely fatal on the 1.2GB-capped compute node containers. Fixed by replacing that with
+`SSTable::merge_files()`, which streams one record at a time from each input via a small
+`RecordCursor` and writes the winner straight to the output file -- peak merge memory is now O(1) per
+input file instead of O(file size). All subsequent runs (including the 3-hour mixed run above) stayed
+memory-healthy throughout, confirmed via repeated `docker stats` sampling.
+
+Reproduce: single-node -- add `--mixed-reads=50000000 --mixed-writes=5000000 --mixed-deletes=1000000`
+to the single-node command above (replaces the standalone `--reads` phase). Distributed -- same
+flags on `cluster_benchmark`.
+
+### What to expect on real, separately-resourced hardware
+
+Every distributed number above was measured with all 4 containers sharing **one** VM's CPU and disk
+-- a deliberately unrealistic deployment (chosen purely because that's the hardware available for
+this project), and Findings #2-3 already show that sharing is the dominant bottleneck for writes.
+Deployed properly -- one physical or virtual machine per compute node, no sibling processes competing
+for the same cores or disk queue -- each node's own write/read path would be free to perform close to
+what the single-node numbers above already demonstrate is achievable on one machine's uncontended
+resources (17,515-17,600 WPS, ~55,000 RPS). With 3 independent nodes each holding its own disjoint
+shard behind its own exclusive lock (see the Distributed Architecture section below -- no cross-node
+locking exists in this design), aggregate write capacity across 3 real machines should **exceed** any
+single machine's own ceiling, not just approach it, since three separate locks/disks can genuinely
+work in parallel where one shared VM's contention currently serializes them. Expect **WPS to climb
+well past the current throttled ~6,190-11,064 range, plausibly toward ~20,000** -- i.e. above even
+the single-node figure, reflecting three independently-writing shards net of the leader-relay and
+network overhead already measured in isolation (~150-185us/op from the original network-only sanity
+check). Reads should see a similar recovery: with per-node data volumes back to what they actually
+are (~1M keys/node, not competing with two siblings' compaction threads for the same disk), expect
+**RPS to climb from the current ~4,560-4,702 toward something much closer to the ~50,000 mark** --
+still short of single-node's ~55,000 (real network hops never disappear), but no longer suppressed by
+artificial resource starvation that has nothing to do with the distributed design itself. This is a
+prediction, not yet a measurement -- the natural next step once multi-VM (or multi-host) deployment
+is available to test against, rather than one shared VM standing in for three.
+
+_Next row goes here once this project is re-tested across genuinely separate machines, or once
+size-tiered compaction replaces the simple size-ratio gate -- add a new row, not a new section._
 
 ---
 
@@ -322,8 +399,41 @@ real comparable-scale result: see "📈 Performance Results" above.
 
 ### Phase 5: Optimization & Efficiency
 * [x] **Bloom Filters:** One filter per SSTable (`include/engine/bloom_filter.h`, `src/bloom_filter.cpp`), built at flush/load time alongside the existing index and consulted in `Get` before `std::ifstream::open()`, so a `Get` can skip opening a file entirely when the filter proves the key definitely isn't in it. 5 hash probes per key (Kirsch-Mitzenmacher double-hashing: two FNV-1a hashes combined as `h1 + i*h2 mod m`, standard practice in production Bloom filters -- provably as effective as 5 genuinely independent hash functions without paying for 5 separate hash computations), 10 bits/key, landing at the standard ~1% false-positive-rate ballpark (~0.94% analytically; **0.60% measured** on a 100,000-key sample -- see `tests/test_bloom_filter.cpp`). Correctness-checked two ways: 5 dedicated unit tests (no false negatives -- a hard guarantee, checked exactly, not sampled; false-positive rate stays well under a generous bound; sizing) plus the full existing suite (36/36 checks) passing unmodified through the public `StorageEngine` API. **Perf-validated at scale, and the result is a genuinely useful negative one:** re-running the 33-generation "biggest" benchmark identically showed RPS/WPS essentially unchanged (~4,412 vs ~4,419 RPS, well within noise) -- see the "Bloom filter re-run" writeup in the Benchmarking section below for the full numbers and why. It disproves this project's original (inferred, never directly measured) assumption that `open()` call count was the dominant per-lookup cost at scale; the real cost is disk I/O for the reads that remain necessary, which a Bloom filter can reduce the *count* of but not the *volume* of. Kept in the codebase because it's still theoretically correct and cheap (and would matter more at smaller scale, or with a colder file-open path than this Linux/Docker environment has), but it's not what actually moves the needle here -- that's the evidence behind moving toward sharding across multiple nodes instead of further single-node read-path optimization.
-* [x] **Compaction:** A background thread (`StorageEngine::StartBackgroundCompaction`, opt-in via `--enable-compaction`/`ENABLE_COMPACTION`) that repeatedly merges the two globally-oldest surviving SSTable generations into one -- never the newest -- discarding obsolete overwritten values and dropping tombstones (safe because nothing older than the oldest pair ever survives to still need shadowing). **Lock-free merge:** SSTables are immutable once written, so the slow part (read both files, merge, write the new one) holds no lock at all; only a brief final metadata swap takes the same `rw_lock` `Put`/`Get`/`Delete` already use -- no per-file locks, no abort/retry needed, since nothing slow ever blocks a reader. Ordering is tracked positionally (vector index), not by filename, so a merged file can get a fresh collision-free sequence number while staying logically oldest; `Manifest::rewrite()` (new: atomic temp-file+rename) durably commits the swap. **Perf-validated at the real "biggest" scale, and the result is dramatic:** see "📈 Performance Results" above -- RPS went from 4,412 to **337,399 (~76.5x)**, WPS +42.7%, DPS +35.5%. **A real efficiency bug found and fixed along the way, not assumed away:** merging "always the two oldest" unconditionally makes the oldest survivor an ever-growing accumulator, fully re-read and re-written on every pass -- caught live at a 6.3GB accumulator mid-merge (~93GB of cumulative write I/O against an ~18GB dataset) before it was fixed with a size-ratio gate (skip the pair once the older file exceeds 4x the newer one's size). This bounds the worst case but means a pair can permanently stop progressing once the ratio is crossed -- true size-tiered compaction (merging smaller, newer generations among themselves first) would do better and is a real follow-up, not yet implemented. Also fixes the generation-count-growing-unboundedly problem this session's earlier benchmarking exposed. Separately noted, still open: stale WAL segments are still never cleaned up after their generation flushes (unrelated to compaction, since a segment becomes redundant the moment its own flush succeeds, not just after a later merge).
-* [ ] **Cold-cache benchmarking:** The Linux/Docker RPS numbers in the "Benchmarking" section above all reflect a warm OS page cache (reads immediately follow the write phase that produced the same dataset). Get a genuine cold-cache number too -- e.g. drop caches between phases, or read data written by a prior, separate `docker run` -- for a fuller "worst case" picture alongside the current "best case" numbers.
+* [x] **Compaction:** A background thread (`StorageEngine::StartBackgroundCompaction`, opt-in via `--enable-compaction`/`ENABLE_COMPACTION`) that repeatedly merges the two globally-oldest surviving SSTable generations into one -- never the newest -- discarding obsolete overwritten values and dropping tombstones (safe because nothing older than the oldest pair ever survives to still need shadowing). **Lock-free merge:** SSTables are immutable once written, so the slow part (read both files, merge, write the new one) holds no lock at all; only a brief final metadata swap takes the same `rw_lock` `Put`/`Get`/`Delete` already use -- no per-file locks, no abort/retry needed, since nothing slow ever blocks a reader. Ordering is tracked positionally (vector index), not by filename, so a merged file can get a fresh collision-free sequence number while staying logically oldest; `Manifest::rewrite()` (new: atomic temp-file+rename) durably commits the swap. **Perf-validated at the real "biggest" scale, cold-cache-controlled, and the honest result is a
+second genuinely useful negative one:** see "📈 Performance Results" above for the full writeup. An
+early same-session measurement claimed a ~76.5x RPS win, but that turned out to be a page-cache
+artifact, not a compaction effect (caught and corrected the same session via a direct warm-vs-cold
+test against the identical on-disk dataset). Once cache state is controlled fairly, compaction shows
+**no measurable read benefit on this hardware** (55,239.9 vs 55,000.5 RPS single-node; 4,659.78 vs
+4,701.8 RPS distributed -- both within noise) and **measurably hurts distributed write throughput**
+(WPS -44%, traced to compaction threads across 3 co-located containers contending for one shared
+VM's CPU/disk, confirmed via a 2-node control test that partially recovered writes). Compaction's
+real, demonstrated value here is bounding disk growth and generation count over time, not raw
+throughput -- with 31GB of RAM against a ~7GB dataset, page cache already makes file count irrelevant
+for reads on this VM. **A real efficiency bug found and fixed along the way, not assumed away:**
+merging "always the two oldest" unconditionally makes the oldest survivor an ever-growing
+accumulator, fully re-read and re-written on every pass -- caught live at a 6.3GB accumulator
+mid-merge (~93GB of cumulative write I/O against an ~18GB dataset) before it was fixed with a
+size-ratio gate (skip the pair once the older file exceeds 4x the newer one's size). This bounds the
+worst case but means a pair can permanently stop progressing once the ratio is crossed -- true
+size-tiered compaction (merging smaller, newer generations among themselves first) would do better
+and is a real follow-up, not yet implemented. A second real bug, found via the mixed-workload test
+and also fixed, not assumed away: the original merge implementation loaded both input files fully
+into memory, which OOM-killed memory-capped compute node containers -- fixed with a streaming
+`SSTable::merge_files()` (O(1) peak memory per input file). Also fixes the generation-count-growing-
+unboundedly problem this session's earlier benchmarking exposed. Separately noted, still open: stale
+WAL segments are still never cleaned up after their generation flushes (unrelated to compaction,
+since a segment becomes redundant the moment its own flush succeeds, not just after a later merge).
+* [x] **Cold-cache benchmarking:** Done, and it mattered far more than expected -- see the
+"📈 Performance Results" methodology correction above. `--drop-caches-before-read` (both benchmark
+binaries) drops the OS page cache immediately before the read/mixed phase via the VM's passwordless
+sudo. Direct warm-vs-cold measurement against the identical on-disk dataset: 105,014 RPS warm vs
+3,389 RPS cold (~31x), which is what actually explained the earlier (incorrect) ~76.5x
+"compaction win" -- the read phase was benefiting from a page cache still warm from the write phase
+that had just run, not from compaction. All rows in the Performance Results table above are now
+cold-started for a fair comparison. The older, non-cache-controlled Linux/Docker RPS numbers
+elsewhere in the "Benchmarking" section below predate this fix and should be read as historical,
+not as currently-comparable figures.
 
 ### Phase 6: Advanced Features
 * [ ] **Value Compression:** Compress each value (LZ4 is the natural choice -- fast enough that decompression cost on the read path stays negligible next to the I/O costs above, unlike heavier schemes optimized for ratio over speed) before writing it into an SSTable record, decompressing on read. Per-value rather than per-block: it fits this project's existing record framing (type + kLen + key + vLen + value) without restructuring the file format, at the cost of losing the better compression ratio a shared block-level dictionary would give across many small values. Matters most for the "large values" benchmark configuration (512-4096B, see below) -- that's exactly the value-size range where compression has real bytes to work with, unlike the earlier 64-1024B default where per-value overhead would dominate any savings.
@@ -332,7 +442,7 @@ real comparable-scale result: see "📈 Performance Results" above.
 ### Phase 7: Distributed Architecture -- ✅ Implemented, correctness-verified, and perf-validated at the real comparable scale
 * [x] **Leader + compute-node sharding:** see "Distributed Architecture" above for the full design, verification, and benchmark writeup. Consistent-hash routing, hand-rolled binary wire protocol, real `docker compose` deployment (4 containers, 1.2GB each), 43 new automated checks, 4 real bugs found and fixed with evidence.
 * [x] **Network-overhead sanity check run** (1M writes/10M reads against the live deployment): 22,663.7 WPS / 21,521.1 RPS, ~176.5us/~185.9us average write/read latency. Useful for knowing roughly what two network hops cost in isolation.
-* [x] **The comparison that actually answers whether sharding helps:** the same 3,000,000-key total keyspace the "biggest" single-node benchmark used, sharded ~1,000,000 keys/node across the 3 compute nodes, run through the identical write/delete/read workload. **Result: RPS up ~7.8% (4,412 -> 4,754), WPS roughly flat (-3.7%), DPS down ~7.7x** (network tax hits cheap ops hardest) -- see "📈 Performance Results" above for the full table and reasoning.
+* [x] **The comparison that actually answers whether sharding helps:** the same 3,000,000-key total keyspace the "biggest" single-node benchmark used, sharded ~1,000,000 keys/node across the 3 compute nodes, run through the identical write/delete/read workload. An early same-session result claimed a modest RPS win from sharding (+7.8%), but that predates the cold-cache methodology fix (see "📈 Performance Results" above) and isn't comparable. **Cold-cache-controlled result: single-node substantially outperforms the distributed cluster** (55,239.9 vs 4,659.78 RPS, no compaction) -- not because sharding is bad, but because this VM gives single-node 32GB of unconstrained RAM against a ~7GB dataset (lets it self-warm into cache almost entirely), while each compute node is capped at 1.2GB against its own ~2.3GB share, so distributed stays genuinely disk-bound throughout with nothing artificial propping it up. See "What to expect on real, separately-resourced hardware" in the Performance Results section for what this predicts once the 3 nodes aren't also fighting each other for the same VM's CPU/disk.
 * [ ] **Resize workflow:** dynamic add/remove of compute nodes with data rebalancing. `HashRing` was deliberately kept minimal (fixed membership, no virtual nodes) specifically so this phase can extend it rather than rewrite it.
 * [ ] **Virtual nodes:** needed for real load balance across a small number of physical nodes -- deferred alongside resize since they're most useful once membership can actually change.
 * [ ] **Failover:** detect and route around an unreachable compute node instead of just failing the request loud (current behavior).
