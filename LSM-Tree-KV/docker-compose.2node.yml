@@ -1,0 +1,63 @@
+# Diagnostic 2-compute-node variant of docker-compose.yml -- NOT the
+# project's primary topology (see docker-compose.yml for that; 3 nodes
+# stays canonical for the README's headline numbers). Exists to test one
+# specific hypothesis: that the distributed benchmark's throughput ceiling
+# is dominated by 3 compute-node processes (each running their own
+# background compaction thread) plus the leader all contending for one
+# shared VM's CPU/disk, not by anything architectural. Removing one
+# compute node removes a third of that contention while each surviving
+# node picks up a larger share of the keyspace (~1.5M keys/node instead of
+# ~1M) -- if RPS/WPS goes UP despite each node doing more work, that's
+# direct evidence the 3-node numbers were contention-bound rather than
+# reflecting some inherent 3-node cost.
+#
+# Usage:
+#   ENABLE_COMPACTION=1 docker compose -f docker-compose.2node.yml up --build -d
+#   docker compose -f docker-compose.2node.yml down -v
+
+services:
+  compute-1:
+    build:
+      context: .
+      target: compute_node
+    mem_limit: 1.2g
+    environment:
+      NODE_ID: compute-1
+      LISTEN_PORT: "7001"
+      DATA_DIR: /data
+      MEMTABLE_THRESHOLD: "100000"
+      ENABLE_COMPACTION: "${ENABLE_COMPACTION:-0}"
+    volumes:
+      - compute1_data_2node:/data
+
+  compute-2:
+    build:
+      context: .
+      target: compute_node
+    mem_limit: 1.2g
+    environment:
+      NODE_ID: compute-2
+      LISTEN_PORT: "7001"
+      DATA_DIR: /data
+      MEMTABLE_THRESHOLD: "100000"
+      ENABLE_COMPACTION: "${ENABLE_COMPACTION:-0}"
+    volumes:
+      - compute2_data_2node:/data
+
+  leader:
+    build:
+      context: .
+      target: leader_node
+    mem_limit: 1.2g
+    environment:
+      LISTEN_PORT: "6000"
+      COMPUTE_NODES: "compute-1:compute-1:7001,compute-2:compute-2:7001"
+    ports:
+      - "6000:6000"
+    depends_on:
+      - compute-1
+      - compute-2
+
+volumes:
+  compute1_data_2node:
+  compute2_data_2node:
