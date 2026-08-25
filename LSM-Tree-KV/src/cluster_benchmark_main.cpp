@@ -453,6 +453,26 @@ int main(int argc, char** argv) {
     }
     double dps = dr.seconds > 0.0 ? static_cast<double>(dr.ops) / dr.seconds : 0.0;
 
+    if (cfg.drop_caches_before_read) {
+        std::cout << "--- Dropping OS page cache before read/mixed phase ---" << std::endl;
+        int rc = std::system("sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null");
+        std::cout << "--- drop_caches exit code: " << rc << " ---" << std::endl;
+    }
+
+    // Run the read/mixed phase and compute its results BEFORE printing
+    // anything -- "--- Results ---" below must mark the true end of the
+    // run for anything watching this process's output for completion
+    // (e.g. a log-polling loop). Printing it right after write+delete,
+    // before the often much longer read/mixed phase even starts, made
+    // every such poll falsely detect "done" as soon as deletes finished.
+    MixedResult mr;
+    ReadResult rr;
+    if (mixed_mode) {
+        mr = run_mixed_phase(cfg);
+    } else {
+        rr = run_read_phase(cfg);
+    }
+
     std::cout << "--- Results ---\n";
     std::cout << "WRITE_OPS=" << cfg.writes << "\n";
     std::cout << "WRITE_SECONDS=" << write_seconds << "\n";
@@ -461,14 +481,7 @@ int main(int argc, char** argv) {
     std::cout << "DELETE_SECONDS=" << dr.seconds << "\n";
     std::cout << "DPS=" << dps << "\n";
 
-    if (cfg.drop_caches_before_read) {
-        std::cout << "--- Dropping OS page cache before read/mixed phase ---" << std::endl;
-        int rc = std::system("sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null");
-        std::cout << "--- drop_caches exit code: " << rc << " ---" << std::endl;
-    }
-
     if (mixed_mode) {
-        MixedResult mr = run_mixed_phase(cfg);
         size_t mixed_total_ops = mr.get_ops + mr.put_ops + mr.delete_ops;
         double mixed_ops_per_sec = mr.seconds > 0.0
             ? static_cast<double>(mixed_total_ops) / mr.seconds : 0.0;
@@ -486,7 +499,6 @@ int main(int argc, char** argv) {
         std::cout << "MIXED_PUT_NEW_KEYS=" << mr.put_new_keys << "\n";
         std::cout << "MIXED_DELETE_OPS=" << mr.delete_ops << "\n";
     } else {
-        ReadResult rr = run_read_phase(cfg);
         double rps = rr.seconds > 0.0 ? static_cast<double>(cfg.reads) / rr.seconds : 0.0;
         double observed_miss_rate = cfg.reads > 0
             ? static_cast<double>(rr.misses) / static_cast<double>(cfg.reads) : 0.0;
