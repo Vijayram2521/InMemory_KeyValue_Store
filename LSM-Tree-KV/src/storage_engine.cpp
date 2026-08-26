@@ -86,6 +86,12 @@ struct StorageEngine::Impl {
     // ever opening it -- see bloom_filter.h for how it's built.
     std::unordered_map<std::string, BloomFilter> bloom_cache;
 
+    // Experimental (see StorageEngine's use_mmap_reads doc comment). Only
+    // ever populated when USE_MMAP is true -- left empty and untouched
+    // otherwise, so the default (unchanged) code path pays zero extra cost.
+    const bool USE_MMAP;
+    std::unordered_map<std::string, MappedFile> mmap_cache;
+
     // Compaction: serializes compact_once() calls (background thread vs. a
     // manual/test call) so two passes never run concurrently -- separate
     // from rw_lock on purpose, since compact_once()'s slow phase (read,
@@ -96,7 +102,8 @@ struct StorageEngine::Impl {
     std::condition_variable compaction_cv_;
     bool compaction_stop_ = false;
 
-    Impl(const std::string& dir, size_t threshold) : data_dir(dir), THRESHOLD(threshold) {
+    Impl(const std::string& dir, size_t threshold, bool use_mmap)
+        : data_dir(dir), THRESHOLD(threshold), USE_MMAP(use_mmap) {
         std::filesystem::create_directories(data_dir);
 
         auto history = Manifest::load_history(data_dir);
@@ -105,6 +112,7 @@ struct StorageEngine::Impl {
             sstable_files.push_back(full_path);
             auto index = SSTable::load_index(full_path);
             bloom_cache.emplace(full_path, build_bloom_filter(index));
+            if (USE_MMAP) mmap_cache.emplace(full_path, MappedFile(full_path));
             index_cache[full_path] = std::move(index);
         }
         // Deliberately the MAX sequence across all entries, not the last
@@ -146,6 +154,7 @@ struct StorageEngine::Impl {
         std::vector<IndexEntry> index;
         if (SSTable::write_file(sst_path, memtable, tombstones, index)) {
             bloom_cache.emplace(sst_path, build_bloom_filter(index));
+            if (USE_MMAP) mmap_cache.emplace(sst_path, MappedFile(sst_path));
             index_cache[sst_path] = std::move(index);
 
             // 2. Register the new file in the Manifest
@@ -246,6 +255,7 @@ struct StorageEngine::Impl {
             // never collide with or overwrite any live file.
             std::filesystem::rename(tmp_path, final_path);
             bloom_cache.emplace(final_path, build_bloom_filter(merged_index));
+            if (USE_MMAP) mmap_cache.emplace(final_path, MappedFile(final_path));
             index_cache[final_path] = std::move(merged_index);
         }
 
@@ -254,6 +264,8 @@ struct StorageEngine::Impl {
         index_cache.erase(path_b);
         bloom_cache.erase(path_a);
         bloom_cache.erase(path_b);
+        mmap_cache.erase(path_a);
+        mmap_cache.erase(path_b);
         if (wrote_file) {
             // Still logically the oldest survivor -- position, not the
             // (fresh, numerically large) sequence number, is what matters.
@@ -321,8 +333,8 @@ struct StorageEngine::Impl {
     }
 };
 
-StorageEngine::StorageEngine(const std::string& data_dir, size_t memtable_threshold)
-    : pImpl(std::make_unique<Impl>(data_dir, memtable_threshold)) {
+StorageEngine::StorageEngine(const std::string& data_dir, size_t memtable_threshold, bool use_mmap_reads)
+    : pImpl(std::make_unique<Impl>(data_dir, memtable_threshold, use_mmap_reads)) {
     std::cout << "Engine initialized at: " << data_dir 
               << " | Active Sequence: " << pImpl->current_seq << std::endl;
 }
@@ -377,7 +389,29 @@ std::optional<std::string> StorageEngine::Get(const std::string& key) {
         }
         auto cache_it = pImpl->index_cache.find(*rit);
         if (cache_it == pImpl->index_cache.end()) continue; // shouldn't happen; defensive
-        auto result = SSTable::search_with_index(*rit, cache_it->second, key);
+
+        SearchResult result;
+        bool used_mmap = false;
+        if (pImpl->USE_MMAP) {
+            auto mmap_it = pImpl->mmap_cache.find(*rit);
+            // Fall back to the ifstream path whenever the mapping isn't
+            // actually usable (missing entry, or present but invalid --
+            // e.g. mmap() unsupported/failed) -- checking .valid() here,
+            // not just whether the cache has an entry, matters: an invalid
+            // MappedFile still gets inserted into mmap_cache (same
+            // population lifecycle as every other per-file cache), and
+            // search_with_index_mmap correctly refuses to read from it,
+            // which would silently look identical to "key not found" if
+            // this fell through to returning that result directly instead
+            // of retrying via the real read path.
+            if (mmap_it != pImpl->mmap_cache.end() && mmap_it->second.valid()) {
+                result = SSTable::search_with_index_mmap(mmap_it->second, cache_it->second, key);
+                used_mmap = true;
+            }
+        }
+        if (!used_mmap) {
+            result = SSTable::search_with_index(*rit, cache_it->second, key);
+        }
         if (result.found) {
             if (result.is_tombstone) return std::nullopt;
             return result.value;

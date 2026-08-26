@@ -1,9 +1,69 @@
 #include "../include/engine/sstable.h"
 #include <algorithm>
+#include <cstring>
 #include <fstream>
 #include <cstdint>
+#if defined(__unix__) || defined(__APPLE__)
+#define KV_HAVE_MMAP 1
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 namespace kv_engine {
+
+// MappedFile is a no-op (always invalid, mmap_reads silently falls back to
+// the ifstream path via Get()'s defensive check) on non-POSIX platforms --
+// this is an experimental, Unix-only optimization, and gating it this way
+// keeps kv_engine/kv_tests/kv_benchmark buildable on Windows for local
+// iteration, same as every other target except the POSIX-socket-only
+// cluster layer.
+#ifdef KV_HAVE_MMAP
+MappedFile::MappedFile(const std::string& filename) {
+    int fd = open(filename.c_str(), O_RDONLY);
+    if (fd < 0) return;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size <= 0) {
+        close(fd);
+        return;
+    }
+    void* p = mmap(nullptr, static_cast<size_t>(st.st_size), PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd); // the mapping itself keeps the file's contents accessible; the fd isn't needed after mmap() returns
+    if (p == MAP_FAILED) return;
+    data_ = p;
+    size_ = static_cast<size_t>(st.st_size);
+}
+
+void MappedFile::reset() {
+    if (data_) {
+        munmap(data_, size_);
+        data_ = nullptr;
+        size_ = 0;
+    }
+}
+#else
+MappedFile::MappedFile(const std::string&) {}
+void MappedFile::reset() {}
+#endif
+
+MappedFile::~MappedFile() { reset(); }
+
+MappedFile::MappedFile(MappedFile&& other) noexcept : data_(other.data_), size_(other.size_) {
+    other.data_ = nullptr;
+    other.size_ = 0;
+}
+
+MappedFile& MappedFile::operator=(MappedFile&& other) noexcept {
+    if (this != &other) {
+        reset();
+        data_ = other.data_;
+        size_ = other.size_;
+        other.data_ = nullptr;
+        other.size_ = 0;
+    }
+    return *this;
+}
 
 namespace {
     // Trailer written at the very end of every SSTable file, at a fixed
@@ -285,6 +345,51 @@ SearchResult SSTable::search_with_index(const std::string& filename,
     std::string value(vLen, '\0');
     if (vLen > 0 && !ifs.read(&value[0], vLen)) return {false, "", false};
     return {true, value, false};
+}
+
+SearchResult SSTable::search_with_index_mmap(const MappedFile& mapped,
+                                              const std::vector<IndexEntry>& index,
+                                              const std::string& key) {
+    if (!mapped.valid()) return {false, "", false};
+
+    auto it = std::lower_bound(index.begin(), index.end(), key,
+        [](const IndexEntry& entry, const std::string& k) { return entry.key < k; });
+    if (it == index.end() || it->key != key) {
+        return {false, "", false};
+    }
+
+    const char* base = mapped.data();
+    const size_t sz = mapped.size();
+    uint64_t off = it->offset;
+
+    if (off + 1 > sz) return {false, "", false};
+    uint8_t type = static_cast<uint8_t>(base[off]);
+    off += 1;
+
+    if (off + sizeof(uint32_t) > sz) return {false, "", false};
+    uint32_t kLen;
+    std::memcpy(&kLen, base + off, sizeof(kLen));
+    off += sizeof(kLen);
+
+    if (off + kLen > sz) return {false, "", false};
+    if (std::string(base + off, kLen) != key) {
+        // The index pointed somewhere that doesn't actually hold `key` --
+        // treat as not-found rather than risk returning the wrong value.
+        return {false, "", false};
+    }
+    off += kLen;
+
+    if (type == 2) { // DELETE / tombstone
+        return {true, "", true};
+    }
+
+    if (off + sizeof(uint32_t) > sz) return {false, "", false};
+    uint32_t vLen;
+    std::memcpy(&vLen, base + off, sizeof(vLen));
+    off += sizeof(vLen);
+
+    if (off + vLen > sz) return {false, "", false};
+    return {true, std::string(base + off, vLen), false};
 }
 
 } // namespace kv_engine

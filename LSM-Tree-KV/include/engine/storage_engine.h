@@ -16,8 +16,15 @@ namespace kv_engine {
              * the historical value used throughout the test suite; callers
              * that need higher throughput (e.g. benchmarks) can raise it so
              * they don't end up with one SSTable file per few writes.
+             * @param use_mmap_reads Experimental, opt-in: when true, every
+             * SSTable is mmap()'d once (at flush/load/compaction time,
+             * alongside the index and Bloom filter) and Get() reads directly
+             * from mapped memory instead of a fresh open()/seekg()/read()
+             * per lookup. Default false leaves the original ifstream-based
+             * read path unchanged, so this is purely opt-in for A/B testing.
              */
-            StorageEngine(const std::string& data_dir = "./data", size_t memtable_threshold = 5);
+            StorageEngine(const std::string& data_dir = "./data", size_t memtable_threshold = 5,
+                          bool use_mmap_reads = false);
             ~StorageEngine() ;
 
             // Prevent copying to avoid multiple engines fighting over the same files

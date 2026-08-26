@@ -29,6 +29,36 @@ namespace kv_engine {
         bool is_tombstone = false;
     };
 
+    // RAII wrapper around a whole SSTable file mapped once via mmap() and
+    // kept resident for the file's lifetime (populated alongside
+    // index_cache/bloom_cache), so a Get() that reaches this file reads
+    // straight out of mapped memory instead of paying a fresh
+    // open()/seekg()/read() syscall sequence on every single lookup. The OS
+    // still pages the underlying file in/out of physical RAM transparently
+    // -- this doesn't bypass the page cache, it just removes the repeated
+    // per-lookup syscall overhead on top of it. Experimental, opt-in (see
+    // StorageEngine's use_mmap_reads) so it can be A/B compared directly
+    // against the existing ifstream path rather than replacing it outright.
+    class MappedFile {
+    public:
+        MappedFile() = default;
+        explicit MappedFile(const std::string& filename);
+        ~MappedFile();
+        MappedFile(MappedFile&& other) noexcept;
+        MappedFile& operator=(MappedFile&& other) noexcept;
+        MappedFile(const MappedFile&) = delete;
+        MappedFile& operator=(const MappedFile&) = delete;
+
+        bool valid() const { return data_ != nullptr; }
+        const char* data() const { return static_cast<const char*>(data_); }
+        size_t size() const { return size_; }
+
+    private:
+        void* data_ = nullptr;
+        size_t size_ = 0;
+        void reset();
+    };
+
     // On-disk layout written by write_file:
     //   [data block]  PUT/DELETE records for every key, in a single merged
     //                 ascending-key sequence (not "all puts then all
@@ -82,5 +112,14 @@ namespace kv_engine {
         static SearchResult search_with_index(const std::string& filename,
                                                const std::vector<IndexEntry>& index,
                                                const std::string& key);
+
+        // Same lookup, same no-scan-fallback guarantee, but reads directly
+        // from an already-mapped file instead of opening a fresh ifstream.
+        // Bounds-checks every read against mapped.size() before touching
+        // it, same defensive posture as search_with_index -- a corrupt
+        // offset fails the lookup rather than reading out of bounds.
+        static SearchResult search_with_index_mmap(const MappedFile& mapped,
+                                                     const std::vector<IndexEntry>& index,
+                                                     const std::string& key);
     };
 }
