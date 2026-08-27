@@ -17,10 +17,11 @@ void kv_tests::run_test_index_checkpoint() {
     KV_CHECK_FALSE(IndexCheckpoint::load_latest(dir).has_value(),
                    "load_latest on a directory with no CHECKPOINT pointer returns nullopt");
 
+    const size_t other_shard = kNumShards > 1 ? kNumShards - 1 : 0;
     ShardedIndex shards;
     shards[0]["alpha"] = Location{1, 10};
     shards[0]["beta"] = Location{2, 20};
-    shards[5]["gamma"] = Location{3, 30};
+    shards[other_shard]["gamma"] = Location{3, 30};
     IndexCheckpoint::write(dir, /*covered_seq=*/42, shards);
 
     auto loaded = IndexCheckpoint::load_latest(dir);
@@ -33,12 +34,12 @@ void kv_tests::run_test_index_checkpoint() {
         auto b = loaded->shards[0].find("beta");
         KV_CHECK(b != loaded->shards[0].end() && b->second.file_seq == 2 && b->second.serial == 20,
                  "shard 0's 'beta' entry round-trips exactly");
-        auto g = loaded->shards[5].find("gamma");
-        KV_CHECK(g != loaded->shards[5].end() && g->second.file_seq == 3 && g->second.serial == 30,
-                 "shard 5's 'gamma' entry round-trips in the correct shard, not shard 0");
+        auto g = loaded->shards[other_shard].find("gamma");
+        KV_CHECK(g != loaded->shards[other_shard].end() && g->second.file_seq == 3 && g->second.serial == 30,
+                 "the other shard's 'gamma' entry round-trips in the correct shard, not shard 0");
         size_t total = 0;
         for (const auto& s : loaded->shards) total += s.size();
-        KV_CHECK_EQ(size_t(3), total, "total entries across all 32 shards matches what was written");
+        KV_CHECK_EQ(size_t(3), total, "total entries across all shards matches what was written");
     }
 
     // A second, newer checkpoint should supersede the first: load_latest
@@ -58,7 +59,7 @@ void kv_tests::run_test_index_checkpoint() {
         auto a = loaded2->shards[0].find("alpha");
         KV_CHECK(a != loaded2->shards[0].end() && a->second.file_seq == 99,
                  "load_latest returns the newer pass's data, not the old pass's");
-        KV_CHECK(loaded2->shards[5].find("gamma") == loaded2->shards[5].end(),
+        KV_CHECK(loaded2->shards[other_shard].find("gamma") == loaded2->shards[other_shard].end(),
                  "the newer pass genuinely replaces the old one -- 'gamma' isn't carried forward "
                  "since the second write() didn't include it");
     }

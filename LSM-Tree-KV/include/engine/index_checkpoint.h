@@ -24,7 +24,15 @@ struct Location {
 // beyond one lock covering the whole StorageEngine. A single named
 // constant so the shard count is a one-line change if it ever needs to
 // differ.
-constexpr size_t kNumShards = 32;
+//
+// Set to 4 (down from an initial 32) as an experiment: at this project's
+// live-key scale, 32 separate heap-allocated bucket arrays scattered across
+// the heap meant a random-key workload rarely revisited the same shard's
+// (and thus same cache lines') bucket array before it went cold again --
+// fewer, larger shards keep each one hotter across more consecutive
+// accesses at the cost of a bigger table per shard. Being tested against
+// the same 32-shard benchmark to see whether that trade nets out ahead.
+constexpr size_t kNumShards = 4;
 
 using ShardedIndex = std::array<std::unordered_map<std::string, Location>, kNumShards>;
 
