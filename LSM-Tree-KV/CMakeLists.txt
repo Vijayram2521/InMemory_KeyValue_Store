@@ -26,6 +26,7 @@ add_library(
     src/manifest.cpp
     src/sstable.cpp
     src/bloom_filter.cpp
+    src/index_checkpoint.cpp
 )
 target_link_libraries(kv_engine Threads::Threads)
 
@@ -39,6 +40,7 @@ set(TEST_SOURCES
     tests/test_bloom_filter.cpp
     tests/test_tombstone.cpp
     tests/test_manifest.cpp
+    tests/test_index_checkpoint.cpp
     tests/test_storage_engine.cpp
     tests/test_compaction.cpp
 )

@@ -86,6 +86,32 @@ namespace kv_engine {
              * not running. Also called from the destructor.
              */
             void StopBackgroundCompaction();
+
+            /**
+             * Snapshots the engine's global key -> SSTable-location index
+             * (used to accelerate Put/Delete/Get lookups) to disk
+             * synchronously. Safe to call at any time; the snapshot is
+             * allowed to be stale by the time it's read back at a future
+             * restart -- StorageEngine reconciles that gap automatically
+             * (see include/engine/index_checkpoint.h), so callers never
+             * need to call this for correctness, only to speed up a future
+             * restart. Always attempts the write; @return false only on an
+             * actual I/O failure.
+             */
+            bool CheckpointIndexOnce();
+
+            /**
+             * Starts a background thread that calls CheckpointIndexOnce()
+             * every `interval`, until StopIndexCheckpointing() is called or
+             * the engine is destroyed. No-op if already running.
+             */
+            void StartIndexCheckpointing(std::chrono::seconds interval = std::chrono::seconds(30));
+
+            /**
+             * Stops the background checkpoint thread if running. No-op if
+             * not running. Also called from the destructor.
+             */
+            void StopIndexCheckpointing();
         private:
             // Mem Table management and WAL handling
             struct Impl;

@@ -5,6 +5,7 @@
 #include <iostream>
 #include "engine/wal.h"
 #include "engine/manifest.h"
+#include "engine/index_checkpoint.h"
 #include <iomanip>
 #include <filesystem>
 #include <algorithm>
@@ -13,6 +14,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <thread>
+#include <functional>
 
 namespace kv_engine {
 
@@ -88,6 +90,32 @@ struct StorageEngine::Impl {
     std::condition_variable compaction_cv_;
     bool compaction_stop_ = false;
 
+    // Global key -> current on-disk location index, sharded into
+    // kNumShards independent maps (see index_checkpoint.h) purely to keep
+    // individual checkpoint files and rehash events smaller -- everything
+    // here still runs under the single rw_lock above, same as every other
+    // cache in this struct. Exists only ever accelerate find_live_location
+    // and Get() (see below); the per-file index_cache/delcol_cache above
+    // remain ground truth, so a missing or stale shard entry degrades to
+    // "fall back to the pre-existing scan," never a wrong answer.
+    ShardedIndex global_key_index;
+
+    static size_t shard_for(const std::string& key) {
+        return std::hash<std::string>{}(key) % kNumShards;
+    }
+
+    // Checkpointing: periodically snapshots global_key_index to disk (see
+    // IndexCheckpoint) so a future restart doesn't have to rebuild it from
+    // every live SSTable's index from scratch. Separate thread/mutex/cv
+    // from compaction's, since checkpointing's "run every fixed interval"
+    // shape doesn't map onto compact_once()'s "run until nothing eligible"
+    // inner loop.
+    std::mutex checkpoint_serialize_mutex_;
+    std::thread checkpoint_thread_;
+    std::mutex checkpoint_cv_mutex_;
+    std::condition_variable checkpoint_cv_;
+    bool checkpoint_stop_ = false;
+
     Impl(const std::string& dir, size_t threshold, bool use_mmap)
         : data_dir(dir), THRESHOLD(threshold), USE_MMAP(use_mmap) {
         std::filesystem::create_directories(data_dir);
@@ -114,6 +142,41 @@ struct StorageEngine::Impl {
             current_seq = std::max(current_seq, entry.sequence + 1);
         }
 
+        // Global key index: load whatever checkpoint exists (possibly
+        // none), then fold in every live generation with sequence >= the
+        // checkpoint's covered_seq, oldest to newest, so a later
+        // generation's copy of a key correctly overwrites an earlier one.
+        // covered_seq defaults to 0 (fold in everything) when no
+        // checkpoint is found -- same loop either way, just a different
+        // starting point. No separate reconciliation pass is needed for
+        // keys that died without a new generation revealing it --
+        // find_live_location's self-heal-on-lookup rule covers that
+        // lazily instead (see its comment below).
+        uint64_t covered_seq = 0;
+        if (auto loaded = IndexCheckpoint::load_latest(data_dir)) {
+            global_key_index = std::move(loaded->shards);
+            covered_seq = loaded->covered_seq;
+        }
+        // `history` is already oldest-to-newest (Manifest::load_history
+        // preserves insertion order, and compact_once()'s rewrite always
+        // keeps the merged/oldest-surviving entry positioned first), so
+        // iterating it directly here means a later generation's entry for
+        // a given key naturally overwrites an earlier one below.
+        for (const auto& entry : history) {
+            if (entry.sequence < covered_seq) continue;
+            std::string full_path = (std::filesystem::path(data_dir) / entry.filename).string();
+            auto idx_it = index_cache.find(full_path);
+            if (idx_it == index_cache.end()) continue;
+            auto del_it = delcol_cache.find(full_path);
+            const auto& del_bits = (del_it != delcol_cache.end()) ? del_it->second : std::vector<uint8_t>{};
+            uint32_t file_seq = static_cast<uint32_t>(entry.sequence);
+            for (const auto& e : idx_it->second) {
+                if (!SSTable::is_dead(del_bits, e.serial)) {
+                    global_key_index[shard_for(e.key)][e.key] = Location{file_seq, static_cast<uint32_t>(e.serial)};
+                }
+            }
+        }
+
         std::string wal_path = get_wal_path(current_seq);
         wal = std::make_unique<WAL>(wal_path);
 
@@ -138,20 +201,47 @@ struct StorageEngine::Impl {
         return (std::filesystem::path(data_dir) / (format_seq(seq) + ".sst")).string();
     }
 
-    struct Location {
-        std::string file;
-        uint64_t serial;
-    };
+    // Looks up `key` in one specific SSTable file (mmap path if enabled and
+    // valid, ifstream path otherwise -- exactly Get()'s existing
+    // per-file branching, factored out so both Get()'s global_key_index
+    // fast path and its per-generation slow-path scan share one
+    // implementation instead of duplicating the mmap/ifstream branch).
+    // Read-only; safe under either a shared_lock or unique_lock.
+    SearchResult search_one_file(const std::string& file, const std::string& key) const {
+        auto cache_it = index_cache.find(file);
+        if (cache_it == index_cache.end()) return {};
+        if (USE_MMAP) {
+            auto mmap_it = mmap_cache.find(file);
+            if (mmap_it != mmap_cache.end() && mmap_it->second.valid()) {
+                return SSTable::search_with_index_mmap(mmap_it->second, cache_it->second, key);
+            }
+        }
+        return SSTable::search_with_index(file, cache_it->second, key);
+    }
 
-    // Searches every live SSTable, newest to oldest, for `key`'s current
-    // on-disk position -- the same search order Get() uses. Skips any
-    // match already marked dead and keeps searching older generations
-    // (defensive: under the eager-marking invariant this should never
-    // actually be reachable in normal operation, since a dead record's
-    // supersession is proven at write time, but this way a violated
-    // invariant degrades to "search a bit further" rather than "return the
-    // wrong answer"). Callers must hold at least a shared_lock.
+    // Locates `key`'s current on-disk position, if any. Fast path: an O(1)
+    // lookup in global_key_index's shard for this key, verified against
+    // that file's del-bitmap before being trusted (self-healing: a hit
+    // that turns out to be dead means a stale checkpoint-loaded entry from
+    // before a delete/overwrite that never got a new generation to reveal
+    // it -- see the Design notes on checkpoint staleness -- erase it and
+    // fall through). Slow path (genuinely new key, or the crash-recovery
+    // gap just described): scan every live SSTable, newest to oldest,
+    // exactly as before this index existed -- this is ground truth; the
+    // fast path is only ever an accelerator over it, never authoritative
+    // on its own. Callers must hold the unique_lock (mutates
+    // global_key_index on the self-heal path).
     std::optional<Location> find_live_location(const std::string& key) {
+        auto& shard = global_key_index[shard_for(key)];
+        auto gi_it = shard.find(key);
+        if (gi_it != shard.end()) {
+            std::string file = get_sst_path(gi_it->second.file_seq);
+            auto del_it = delcol_cache.find(file);
+            bool dead = del_it != delcol_cache.end() && SSTable::is_dead(del_it->second, gi_it->second.serial);
+            if (!dead) return gi_it->second;
+            shard.erase(gi_it);
+        }
+
         for (auto rit = sstable_files.rbegin(); rit != sstable_files.rend(); ++rit) {
             auto cache_it = index_cache.find(*rit);
             if (cache_it == index_cache.end()) continue;
@@ -160,21 +250,26 @@ struct StorageEngine::Impl {
             if (it != cache_it->second.end() && it->key == key) {
                 auto del_it = delcol_cache.find(*rit);
                 bool dead = del_it != delcol_cache.end() && SSTable::is_dead(del_it->second, it->serial);
-                if (!dead) return Location{*rit, it->serial};
+                if (!dead) return Location{static_cast<uint32_t>(parse_seq_from_path(*rit)),
+                                            static_cast<uint32_t>(it->serial)};
             }
         }
         return std::nullopt;
     }
 
-    // Flips a record's bit both in the resident cache and on disk. Callers
-    // must hold the unique_lock (all callers here are apply_put/
-    // apply_delete, which already require it).
-    void mark_dead(const Location& loc) {
-        auto del_it = delcol_cache.find(loc.file);
+    // Marks `loc` dead: flips its del-bitmap bit (in-memory + on-disk) and
+    // removes `key` from global_key_index, since the index only ever
+    // tracks currently-live locations. Callers must hold the unique_lock
+    // (all callers here are apply_put/apply_delete, which already require
+    // it).
+    void mark_dead(const std::string& key, const Location& loc) {
+        std::string file = get_sst_path(loc.file_seq);
+        auto del_it = delcol_cache.find(file);
         if (del_it != delcol_cache.end()) {
             SSTable::mark_dead_in_memory(del_it->second, loc.serial);
         }
-        SSTable::flip_dead_on_disk(SSTable::del_path_for(loc.file), loc.serial);
+        SSTable::flip_dead_on_disk(SSTable::del_path_for(file), loc.serial);
+        global_key_index[shard_for(key)].erase(key);
     }
 
     // Core Put/Delete logic, shared between live calls and WAL replay
@@ -184,14 +279,14 @@ struct StorageEngine::Impl {
     // or implicitly single-threaded during construction).
     void apply_put(const std::string& key, const std::string& value) {
         auto loc = find_live_location(key);
-        if (loc) mark_dead(*loc);
+        if (loc) mark_dead(key, *loc);
         memtable[key] = value;
     }
 
     void apply_delete(const std::string& key) {
         memtable.erase(key);
         auto loc = find_live_location(key);
-        if (loc) mark_dead(*loc);
+        if (loc) mark_dead(key, *loc);
     }
 
     void flush() {
@@ -203,6 +298,12 @@ struct StorageEngine::Impl {
         std::vector<IndexEntry> index;
         if (SSTable::write_file(sst_path, memtable, index)) {
             if (USE_MMAP) mmap_cache.emplace(sst_path, MappedFile(sst_path));
+
+            uint32_t this_file_seq = static_cast<uint32_t>(current_seq);
+            for (const auto& entry : index) {
+                global_key_index[shard_for(entry.key)][entry.key] =
+                    Location{this_file_seq, static_cast<uint32_t>(entry.serial)};
+            }
             index_cache[sst_path] = std::move(index);
 
             // Del-bitmap sized to the flush threshold (the "flush key
@@ -331,6 +432,20 @@ struct StorageEngine::Impl {
             if (USE_MMAP) mmap_cache.emplace(final_path, MappedFile(final_path));
             SSTable::save_del_bitmap(SSTable::del_path_for(final_path), merged_del);
             delcol_cache[final_path] = std::move(merged_del);
+
+            // Every surviving record gets a FRESH serial in the merged
+            // file, so (unlike Put/Delete) this can't rely on
+            // global_key_index already being correct for these keys --
+            // each one needs its entry rewritten to point at the new
+            // file+serial directly. Entries for the merged-away files' now
+            // fully-dead keys need no cleanup here: they were already
+            // erased when they died, via mark_dead, potentially
+            // generations before this compaction pass ever ran.
+            uint32_t merged_file_seq = static_cast<uint32_t>(merged_seq);
+            for (const auto& entry : merged_index) {
+                global_key_index[shard_for(entry.key)][entry.key] =
+                    Location{merged_file_seq, static_cast<uint32_t>(entry.serial)};
+            }
             index_cache[final_path] = std::move(merged_index);
         }
 
@@ -405,8 +520,53 @@ struct StorageEngine::Impl {
         compaction_thread_.join();
     }
 
+    // Snapshots global_key_index to disk. Copies it under a brief
+    // shared_lock (consistent with how compact_once() snapshots
+    // del-bitmaps before its own slow phase), then does the actual disk
+    // write outside any lock, so a large index doesn't hold up concurrent
+    // Put/Delete/Get for the duration of the write -- only for the copy.
+    bool checkpoint_index_once() {
+        std::lock_guard<std::mutex> serialize(checkpoint_serialize_mutex_);
+
+        ShardedIndex snapshot;
+        uint64_t seq_marker;
+        {
+            std::shared_lock lock(rw_lock);
+            snapshot = global_key_index;
+            seq_marker = current_seq;
+        }
+        IndexCheckpoint::write(data_dir, seq_marker, snapshot);
+        return true;
+    }
+
+    void checkpoint_loop(std::chrono::seconds interval) {
+        std::unique_lock<std::mutex> lock(checkpoint_cv_mutex_);
+        while (!checkpoint_cv_.wait_for(lock, interval, [this] { return checkpoint_stop_; })) {
+            lock.unlock();
+            checkpoint_index_once();
+            lock.lock();
+        }
+    }
+
+    void start_index_checkpointing(std::chrono::seconds interval) {
+        if (checkpoint_thread_.joinable()) return; // already running
+        checkpoint_stop_ = false;
+        checkpoint_thread_ = std::thread([this, interval] { checkpoint_loop(interval); });
+    }
+
+    void stop_index_checkpointing() {
+        if (!checkpoint_thread_.joinable()) return;
+        {
+            std::lock_guard<std::mutex> lock(checkpoint_cv_mutex_);
+            checkpoint_stop_ = true;
+        }
+        checkpoint_cv_.notify_all();
+        checkpoint_thread_.join();
+    }
+
     ~Impl() {
         stop_background_compaction();
+        stop_index_checkpointing();
     }
 };
 
@@ -448,36 +608,34 @@ std::optional<std::string> StorageEngine::Get(const std::string& key) {
         return it->second;
     }
 
-    // Search SSTables newest to oldest; on an index hit, check the file's
+    // Fast path: global_key_index gives an O(1) candidate location instead
+    // of scanning every live generation newest-to-oldest. A dead candidate
+    // falls through to the slow path below rather than being trusted --
+    // Get() only holds a shared_lock, so unlike find_live_location it can't
+    // self-heal a stale entry itself (that happens lazily, the next time a
+    // Put/Delete touches this key, under the unique_lock).
+    auto& shard = pImpl->global_key_index[Impl::shard_for(key)];
+    auto gi_it = shard.find(key);
+    if (gi_it != shard.end()) {
+        std::string file = pImpl->get_sst_path(gi_it->second.file_seq);
+        auto del_it = pImpl->delcol_cache.find(file);
+        bool dead = del_it != pImpl->delcol_cache.end() &&
+                    SSTable::is_dead(del_it->second, gi_it->second.serial);
+        if (!dead) {
+            auto result = pImpl->search_one_file(file, key);
+            if (result.found) return result.value;
+        }
+    }
+
+    // Slow path: scan every live generation newest-to-oldest, exactly as
+    // before this optimization existed -- reached for a genuine miss, or
+    // the narrow crash-recovery gap where global_key_index hasn't caught
+    // up to a newer generation yet. On an index hit, check the file's
     // del-bitmap before trusting the value -- a set bit means this record
     // has since been superseded or deleted, so keep searching older
     // generations exactly as a tombstone used to make this loop do.
     for (auto rit = pImpl->sstable_files.rbegin(); rit != pImpl->sstable_files.rend(); ++rit) {
-        auto cache_it = pImpl->index_cache.find(*rit);
-        if (cache_it == pImpl->index_cache.end()) continue; // shouldn't happen; defensive
-
-        SearchResult result;
-        bool used_mmap = false;
-        if (pImpl->USE_MMAP) {
-            auto mmap_it = pImpl->mmap_cache.find(*rit);
-            // Fall back to the ifstream path whenever the mapping isn't
-            // actually usable (missing entry, or present but invalid --
-            // e.g. mmap() unsupported/failed) -- checking .valid() here,
-            // not just whether the cache has an entry, matters: an invalid
-            // MappedFile still gets inserted into mmap_cache (same
-            // population lifecycle as every other per-file cache), and
-            // search_with_index_mmap correctly refuses to read from it,
-            // which would silently look identical to "key not found" if
-            // this fell through to returning that result directly instead
-            // of retrying via the real read path.
-            if (mmap_it != pImpl->mmap_cache.end() && mmap_it->second.valid()) {
-                result = SSTable::search_with_index_mmap(mmap_it->second, cache_it->second, key);
-                used_mmap = true;
-            }
-        }
-        if (!used_mmap) {
-            result = SSTable::search_with_index(*rit, cache_it->second, key);
-        }
+        auto result = pImpl->search_one_file(*rit, key);
         if (result.found) {
             auto del_it = pImpl->delcol_cache.find(*rit);
             bool dead = del_it != pImpl->delcol_cache.end() && SSTable::is_dead(del_it->second, result.serial);
@@ -510,6 +668,18 @@ void StorageEngine::StartBackgroundCompaction(std::chrono::seconds poll_interval
 
 void StorageEngine::StopBackgroundCompaction() {
     pImpl->stop_background_compaction();
+}
+
+bool StorageEngine::CheckpointIndexOnce() {
+    return pImpl->checkpoint_index_once();
+}
+
+void StorageEngine::StartIndexCheckpointing(std::chrono::seconds interval) {
+    pImpl->start_index_checkpointing(interval);
+}
+
+void StorageEngine::StopIndexCheckpointing() {
+    pImpl->stop_index_checkpointing();
 }
 
 } // namespace kv_engine

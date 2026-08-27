@@ -32,10 +32,16 @@ int main() {
         kv_tests::run_test_manifest();
         std::cout << std::endl;
 
+        kv_tests::run_test_index_checkpoint();
+        std::cout << std::endl;
+
         kv_tests::run_test_storage_engine_edge_cases();
         std::cout << std::endl;
 
         kv_tests::run_test_storage_engine_generations();
+        std::cout << std::endl;
+
+        kv_tests::run_test_global_index_restart();
         std::cout << std::endl;
 
         kv_tests::run_test_compaction();

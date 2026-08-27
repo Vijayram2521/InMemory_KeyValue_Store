@@ -18,8 +18,10 @@ namespace kv_tests {
     void run_test_bloom_filter();
     void run_test_tombstone();
     void run_test_manifest();
+    void run_test_index_checkpoint();
     void run_test_storage_engine_edge_cases();
     void run_test_storage_engine_generations();
+    void run_test_global_index_restart();
     void run_test_compaction();
 
     // Cluster-layer tests (kv_cluster_tests binary, Linux-only -- see
