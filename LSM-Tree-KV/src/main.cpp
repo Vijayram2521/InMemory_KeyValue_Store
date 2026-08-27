@@ -44,6 +44,9 @@ int main() {
         kv_tests::run_test_global_index_restart();
         std::cout << std::endl;
 
+        kv_tests::run_test_concurrency();
+        std::cout << std::endl;
+
         kv_tests::run_test_compaction();
         std::cout << std::endl;
 

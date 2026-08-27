@@ -42,6 +42,7 @@ set(TEST_SOURCES
     tests/test_manifest.cpp
     tests/test_index_checkpoint.cpp
     tests/test_storage_engine.cpp
+    tests/test_concurrency.cpp
     tests/test_compaction.cpp
 )
 

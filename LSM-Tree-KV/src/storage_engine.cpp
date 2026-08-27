@@ -2,6 +2,8 @@
 #include <map>
 #include <mutex>
 #include <shared_mutex>
+#include <atomic>
+#include <array>
 #include <iostream>
 #include "engine/wal.h"
 #include "engine/manifest.h"
@@ -51,38 +53,57 @@ uint64_t parse_seq_from_path(const std::string& path) {
 constexpr double kMaxOlderToNewerSizeRatio = 4.0;
 
 struct StorageEngine::Impl {
+    // --- Lock domains ---
+    // Three independent locks replace what used to be one engine-wide
+    // rw_lock, so operations that don't actually touch the same data stop
+    // blocking each other. Governing rules, load-bearing for deadlock
+    // freedom:
+    //   1. `files_lock` and any `shard_locks[i]` are NEVER held
+    //      simultaneously by the same thread, in either order -- every
+    //      function below acquires one, fully releases it, then (if
+    //      needed) acquires the other, rather than nesting them. This
+    //      alone makes deadlock between these two impossible.
+    //   2. `memtable_lock`, when held at all together with the others, is
+    //      always the OUTERMOST lock (Put/Delete hold it for their whole
+    //      call, and apply_put/apply_delete/flush -- invoked from inside
+    //      that hold -- acquire files_lock/shard_locks internally).
+    //      Nothing ever acquires files_lock or shard_locks first and then
+    //      tries to acquire memtable_lock while still holding them.
+    //
+    // memtable_lock guards `memtable` and the `wal` pointer itself (not
+    // WAL's internals, which already have their own mutex for the actual
+    // disk write). flush() deliberately still runs its entire body
+    // (including the disk write) under this lock rather than releasing it
+    // partway through -- see flush()'s own comment for why that's not just
+    // an optimization left on the table.
+    std::shared_mutex memtable_lock;
     std::map<std::string, std::string> memtable;
-    std::shared_mutex rw_lock;
     std::unique_ptr<WAL> wal;
-    uint64_t current_seq;
-    std::string data_dir;
-    std::vector<std::string> sstable_files;
-    size_t THRESHOLD;
-    // Every SSTable's index, keyed by its file path. Populated once here at
-    // startup (for generations recovered via the Manifest) or immediately
-    // on flush() (for generations this process writes itself) -- never
-    // lazily inside Get(), because Get() only takes a shared_lock and
-    // multiple readers mutating this map concurrently would race. flush()
-    // always runs under Put()/Delete()'s unique_lock, so it's safe to
-    // mutate here without extra locking.
-    std::unordered_map<std::string, std::vector<IndexEntry>> index_cache;
-    // Same lifecycle/locking rationale as index_cache above: one del-bitmap
-    // per SSTable, mirroring the on-disk .del file, mutated in place (both
-    // here and on disk) whenever a record in that file is superseded or
-    // deleted -- see find_live_location/mark_dead below. This is what lets
-    // "dead" be known eagerly at write time rather than discovered lazily
-    // at merge time.
-    std::unordered_map<std::string, std::vector<uint8_t>> delcol_cache;
 
-    // Experimental (see StorageEngine's use_mmap_reads doc comment). Only
-    // ever populated when USE_MMAP is true -- left empty and untouched
-    // otherwise, so the default (unchanged) code path pays zero extra cost.
+    // Sequence numbers are claimed via fetch_add wherever a flush or
+    // compaction pass needs one -- atomicity alone guarantees no two
+    // passes ever claim the same number, with no need to coordinate with
+    // memtable_lock or files_lock just to keep a counter consistent.
+    std::atomic<uint64_t> current_seq{0};
+
+    std::string data_dir;
+    size_t THRESHOLD;
+
+    // files_lock guards every SSTable-level cache: index_cache,
+    // delcol_cache (bitmap CONTENTS included -- flipping a bit is a
+    // read-modify-write on a shared byte, which needs exclusive access
+    // just like inserting into the map does), mmap_cache, and
+    // sstable_files.
+    std::shared_mutex files_lock;
+    std::vector<std::string> sstable_files;
+    std::unordered_map<std::string, std::vector<IndexEntry>> index_cache;
+    std::unordered_map<std::string, std::vector<uint8_t>> delcol_cache;
     const bool USE_MMAP;
     std::unordered_map<std::string, MappedFile> mmap_cache;
 
     // Compaction: serializes compact_once() calls (background thread vs. a
     // manual/test call) so two passes never run concurrently -- separate
-    // from rw_lock on purpose, since compact_once()'s slow phase (read,
+    // from files_lock on purpose, since compact_once()'s slow phase (read,
     // merge, write) deliberately holds no lock at all.
     std::mutex compaction_serialize_mutex_;
     std::thread compaction_thread_;
@@ -91,14 +112,15 @@ struct StorageEngine::Impl {
     bool compaction_stop_ = false;
 
     // Global key -> current on-disk location index, sharded into
-    // kNumShards independent maps (see index_checkpoint.h) purely to keep
-    // individual checkpoint files and rehash events smaller -- everything
-    // here still runs under the single rw_lock above, same as every other
-    // cache in this struct. Exists only ever accelerate find_live_location
-    // and Get() (see below); the per-file index_cache/delcol_cache above
+    // kNumShards independent maps (see index_checkpoint.h), each with its
+    // own lock -- this is what turns different-shard Puts/Deletes/Gets
+    // into genuinely independent operations instead of all serializing on
+    // one structure. Exists only to accelerate find_live_location and
+    // Get() (see below); the per-file index_cache/delcol_cache above
     // remain ground truth, so a missing or stale shard entry degrades to
     // "fall back to the pre-existing scan," never a wrong answer.
     ShardedIndex global_key_index;
+    std::array<std::shared_mutex, kNumShards> shard_locks;
 
     static size_t shard_for(const std::string& key) {
         return std::hash<std::string>{}(key) % kNumShards;
@@ -116,6 +138,10 @@ struct StorageEngine::Impl {
     std::condition_variable checkpoint_cv_;
     bool checkpoint_stop_ = false;
 
+    // Constructor runs single-threaded (nothing else can reach this object
+    // yet, since StorageEngine's constructor hasn't returned), so it reads
+    // and mutates every field below directly with no locking at all --
+    // correct in the same way none of this needed rw_lock before either.
     Impl(const std::string& dir, size_t threshold, bool use_mmap)
         : data_dir(dir), THRESHOLD(threshold), USE_MMAP(use_mmap) {
         std::filesystem::create_directories(data_dir);
@@ -137,10 +163,11 @@ struct StorageEngine::Impl {
         // are no longer the same thing -- using the wrong one here would
         // let a future flush reuse an already-used sequence number and
         // silently overwrite a compacted file.
-        current_seq = 0;
+        uint64_t max_seq = 0;
         for (const auto& entry : history) {
-            current_seq = std::max(current_seq, entry.sequence + 1);
+            max_seq = std::max(max_seq, entry.sequence + 1);
         }
+        current_seq = max_seq;
 
         // Global key index: load whatever checkpoint exists (possibly
         // none), then fold in every live generation with sequence >= the
@@ -177,7 +204,34 @@ struct StorageEngine::Impl {
             }
         }
 
-        std::string wal_path = get_wal_path(current_seq);
+        // Find the current WAL segment by scanning for .log files
+        // directly, rather than deriving its path from current_seq.
+        // current_seq is a single shared counter that BOTH flush() and
+        // compact_once() claim unique sequence numbers from (purely to
+        // keep SSTable naming globally unique) -- but only flush() ever
+        // creates a new WAL file, always at (that flush's own claimed
+        // sequence + 1). If compact_once() claims a later number AFTER
+        // the last flush before shutdown (very possible with background
+        // compaction running independently of the write path), current_seq
+        // ends up higher than the sequence the actual active WAL file was
+        // named with -- computing the path from current_seq would then
+        // open a nonexistent file, silently replaying nothing and losing
+        // every write since that last flush. The highest-numbered .log
+        // file actually present on disk is unambiguously the correct one
+        // regardless of what compaction did to the shared counter, since
+        // nothing else ever creates .log files.
+        uint64_t latest_wal_seq = 0;
+        bool found_wal = false;
+        for (const auto& dirent : std::filesystem::directory_iterator(data_dir)) {
+            if (dirent.path().extension() == ".log") {
+                uint64_t seq = std::stoull(dirent.path().stem().string());
+                if (!found_wal || seq > latest_wal_seq) {
+                    latest_wal_seq = seq;
+                    found_wal = true;
+                }
+            }
+        }
+        std::string wal_path = found_wal ? get_wal_path(latest_wal_seq) : get_wal_path(current_seq.load());
         wal = std::make_unique<WAL>(wal_path);
 
         // Replay: redo each PUT/DELETE through the SAME apply_put/
@@ -202,11 +256,8 @@ struct StorageEngine::Impl {
     }
 
     // Looks up `key` in one specific SSTable file (mmap path if enabled and
-    // valid, ifstream path otherwise -- exactly Get()'s existing
-    // per-file branching, factored out so both Get()'s global_key_index
-    // fast path and its per-generation slow-path scan share one
-    // implementation instead of duplicating the mmap/ifstream branch).
-    // Read-only; safe under either a shared_lock or unique_lock.
+    // valid, ifstream path otherwise). Read-only. Callers must hold
+    // files_lock (shared is sufficient).
     SearchResult search_one_file(const std::string& file, const std::string& key) const {
         auto cache_it = index_cache.find(file);
         if (cache_it == index_cache.end()) return {};
@@ -221,27 +272,70 @@ struct StorageEngine::Impl {
 
     // Locates `key`'s current on-disk position, if any. Fast path: an O(1)
     // lookup in global_key_index's shard for this key, verified against
-    // that file's del-bitmap before being trusted (self-healing: a hit
-    // that turns out to be dead means a stale checkpoint-loaded entry from
-    // before a delete/overwrite that never got a new generation to reveal
-    // it -- see the Design notes on checkpoint staleness -- erase it and
-    // fall through). Slow path (genuinely new key, or the crash-recovery
-    // gap just described): scan every live SSTable, newest to oldest,
-    // exactly as before this index existed -- this is ground truth; the
-    // fast path is only ever an accelerator over it, never authoritative
-    // on its own. Callers must hold the unique_lock (mutates
-    // global_key_index on the self-heal path).
+    // that file's del-bitmap before being trusted. Slow path (genuinely
+    // new key, or the narrow crash-recovery gap described below): scan
+    // every live SSTable, newest to oldest, exactly as before this index
+    // existed -- this is ground truth; the fast path is only ever an
+    // accelerator over it, never authoritative on its own.
+    //
+    // Locking: shard lock and files_lock are acquired and fully released
+    // one at a time, never nested (see the struct-level comment on lock
+    // ordering) -- the Location value is copied out of the shard map
+    // before files_lock is even touched.
     std::optional<Location> find_live_location(const std::string& key) {
-        auto& shard = global_key_index[shard_for(key)];
-        auto gi_it = shard.find(key);
-        if (gi_it != shard.end()) {
-            std::string file = get_sst_path(gi_it->second.file_seq);
-            auto del_it = delcol_cache.find(file);
-            bool dead = del_it != delcol_cache.end() && SSTable::is_dead(del_it->second, gi_it->second.serial);
-            if (!dead) return gi_it->second;
-            shard.erase(gi_it);
+        size_t shard = shard_for(key);
+
+        std::optional<Location> maybe_loc;
+        {
+            std::shared_lock slock(shard_locks[shard]);
+            auto gi_it = global_key_index[shard].find(key);
+            if (gi_it != global_key_index[shard].end()) maybe_loc = gi_it->second;
         }
 
+        if (maybe_loc) {
+            std::string file = get_sst_path(maybe_loc->file_seq);
+            bool trustworthy_and_live;
+            {
+                std::shared_lock flock(files_lock);
+                auto del_it = delcol_cache.find(file);
+                // If the file isn't in files_lock's domain at all, it was
+                // most likely just compacted away by a pass whose
+                // separate shard-index update (see compact_once()) hasn't
+                // run yet -- global_key_index[shard] is temporarily
+                // pointing at a generation files_lock no longer knows
+                // about. Treating that as "not dead, therefore live" (the
+                // original bug here) would let mark_dead below flip a bit
+                // in a file that's gone instead of the record's actual
+                // current copy, leaving that real copy permanently
+                // unmarked -- exactly the gap that let a later compaction
+                // pass "resurrect" a stale pointer over a legitimately
+                // newer one. Only a file files_lock still recognizes, with
+                // its bit unset, counts as trustworthy; anything else
+                // (explicitly dead, or unknown) falls through to the
+                // slow-path scan below, which is always internally
+                // consistent since it holds files_lock for its whole
+                // duration.
+                trustworthy_and_live = del_it != delcol_cache.end() &&
+                                        !SSTable::is_dead(del_it->second, maybe_loc->serial);
+            }
+            if (trustworthy_and_live) return *maybe_loc;
+
+            // Stale entry (explicitly dead, or pointing at a file
+            // files_lock no longer recognizes) -- self-heal by erasing
+            // it, but re-verify it's still exactly the same entry first
+            // (files_lock was not held together with the shard lock
+            // above, so another thread -- e.g. a flush() for this very
+            // key -- could have already replaced it with a fresh, correct
+            // entry in the gap; never blindly erase without checking).
+            std::unique_lock slock(shard_locks[shard]);
+            auto gi_it = global_key_index[shard].find(key);
+            if (gi_it != global_key_index[shard].end() &&
+                gi_it->second.file_seq == maybe_loc->file_seq && gi_it->second.serial == maybe_loc->serial) {
+                global_key_index[shard].erase(gi_it);
+            }
+        }
+
+        std::shared_lock flock(files_lock);
         for (auto rit = sstable_files.rbegin(); rit != sstable_files.rend(); ++rit) {
             auto cache_it = index_cache.find(*rit);
             if (cache_it == index_cache.end()) continue;
@@ -257,26 +351,31 @@ struct StorageEngine::Impl {
         return std::nullopt;
     }
 
-    // Marks `loc` dead: flips its del-bitmap bit (in-memory + on-disk) and
-    // removes `key` from global_key_index, since the index only ever
-    // tracks currently-live locations. Callers must hold the unique_lock
-    // (all callers here are apply_put/apply_delete, which already require
-    // it).
+    // Marks `loc` dead: flips its del-bitmap bit (in-memory + on-disk),
+    // then removes `key` from global_key_index, since the index only ever
+    // tracks currently-live locations. files_lock and the shard lock are
+    // acquired and released sequentially, never nested.
     void mark_dead(const std::string& key, const Location& loc) {
         std::string file = get_sst_path(loc.file_seq);
-        auto del_it = delcol_cache.find(file);
-        if (del_it != delcol_cache.end()) {
-            SSTable::mark_dead_in_memory(del_it->second, loc.serial);
+        {
+            std::unique_lock flock(files_lock);
+            auto del_it = delcol_cache.find(file);
+            if (del_it != delcol_cache.end()) {
+                SSTable::mark_dead_in_memory(del_it->second, loc.serial);
+            }
+            SSTable::flip_dead_on_disk(SSTable::del_path_for(file), loc.serial);
         }
-        SSTable::flip_dead_on_disk(SSTable::del_path_for(file), loc.serial);
-        global_key_index[shard_for(key)].erase(key);
+        {
+            std::unique_lock slock(shard_locks[shard_for(key)]);
+            global_key_index[shard_for(key)].erase(key);
+        }
     }
 
     // Core Put/Delete logic, shared between live calls and WAL replay
     // during recovery -- callers are responsible for the WAL append (live
     // calls do it before calling these; replay already has a durable WAL
-    // entry it's redoing). Requires the unique_lock (held by Put/Delete,
-    // or implicitly single-threaded during construction).
+    // entry it's redoing). Requires memtable_lock held exclusively (held
+    // by Put/Delete, or implicitly single-threaded during construction).
     void apply_put(const std::string& key, const std::string& value) {
         auto loc = find_live_location(key);
         if (loc) mark_dead(key, *loc);
@@ -289,50 +388,108 @@ struct StorageEngine::Impl {
         if (loc) mark_dead(key, *loc);
     }
 
+    // Requires memtable_lock held exclusively by the caller (Put/
+    // ForceFlush) -- deliberately runs its ENTIRE body, including the
+    // SSTable disk write, under that hold rather than releasing it
+    // partway through the way compact_once() releases its lock during its
+    // slow merge phase. That's not an oversight: compact_once() merges
+    // already-durable, already-visible files, so releasing its lock
+    // exposes nothing new to a concurrent reader. flush() is draining the
+    // ONLY copy of not-yet-durable data out of memory -- clearing the
+    // memtable before the write completes would create a window where a
+    // just-flushed key is invisible to Get() (gone from the memtable, not
+    // yet indexed on disk). The standard fix for that (keeping a
+    // read-only "immutable memtable" snapshot visible during the write)
+    // reopens a worse hole: a concurrent Delete() for a key in that
+    // snapshot can't remove it from a structure being concurrently read
+    // by the write itself, so the delete would go nowhere and the flush
+    // would durably persist the stale value -- solving that needs a
+    // tombstone-shaped mechanism again, undoing exactly what the
+    // del-bitmap redesign removed. Keeping flush() fully synchronous under
+    // memtable_lock avoids that hazard entirely, at the cost of Put/Delete
+    // still blocking on any flush they trigger -- same as before this
+    // change, just no longer blocking Gets/Puts/Deletes for OTHER keys
+    // that don't need the same shard/file locks flush() briefly takes.
     void flush() {
         if (memtable.empty()) return;
 
-        std::string sst_path = get_sst_path(current_seq);
-        std::cout << "--- Persisting Generation " << current_seq << " to Disk ---" << std::endl;
+        uint64_t seq = current_seq.fetch_add(1);
+        std::string sst_path = get_sst_path(seq);
+        std::cout << "--- Persisting Generation " << seq << " to Disk ---" << std::endl;
 
         std::vector<IndexEntry> index;
         if (SSTable::write_file(sst_path, memtable, index)) {
-            if (USE_MMAP) mmap_cache.emplace(sst_path, MappedFile(sst_path));
-
-            uint32_t this_file_seq = static_cast<uint32_t>(current_seq);
-            for (const auto& entry : index) {
-                global_key_index[shard_for(entry.key)][entry.key] =
-                    Location{this_file_seq, static_cast<uint32_t>(entry.serial)};
-            }
-            index_cache[sst_path] = std::move(index);
-
             // Del-bitmap sized to the flush threshold (the "flush key
             // limit"), not the actual record count -- most bits stay
             // unused if fewer than THRESHOLD keys were flushed (e.g. via
             // ForceFlush), which is harmless.
             auto del_bits = SSTable::make_del_bitmap(THRESHOLD);
             SSTable::save_del_bitmap(SSTable::del_path_for(sst_path), del_bits);
-            delcol_cache[sst_path] = std::move(del_bits);
 
-            Manifest::add_entry(data_dir, format_seq(current_seq) + ".sst", current_seq);
+            // Register the new file in files_lock's domain FIRST, before
+            // global_key_index can point at it below -- caught by the
+            // concurrency stress test: with the order reversed, a
+            // concurrent find_live_location() that discovered this file
+            // via global_key_index (already updated) but found files_lock
+            // didn't recognize it yet (not yet registered) would correctly
+            // refuse to trust it as live, per find_live_location's own
+            // safety check -- but that also meant it couldn't successfully
+            // mark it dead on a legitimate overwrite, silently dropping the
+            // dead-mark. The stale record then stayed invisible during the
+            // live session (masked by the memtable holding the real,
+            // newer value) but resurfaced as live data the moment a
+            // restart rebuilt the index purely from on-disk state, which
+            // has no memtable to mask it. Registering the file before
+            // publishing it via the index closes that window entirely.
+            //
+            // Manifest::add_entry (an append) is deliberately made HERE,
+            // under files_lock, rather than after releasing it -- also
+            // caught by the concurrency stress test, restart-only
+            // failures traced to this: compact_once()'s Manifest::rewrite
+            // (a full-file replace via temp+rename) already runs under
+            // its own files_lock hold. Under the single engine-wide lock
+            // this file replaced, that lock alone made add_entry and
+            // rewrite mutually exclusive for free; splitting the lock
+            // without moving add_entry inside files_lock let an append
+            // land on the manifest file mid-replacement -- landing on the
+            // file rewrite() had just renamed away from (silently lost,
+            // written to an orphaned inode) or racing its own read of
+            // sstable_files (producing a duplicate entry for this exact
+            // file). Both are on-disk corruption that a live session's
+            // Get() calls don't observe (they use the in-memory
+            // sstable_files/index_cache, unaffected), which is why this
+            // only ever showed up after a restart forced a from-scratch
+            // rebuild off the actual manifest file.
+            {
+                std::unique_lock flock(files_lock);
+                if (USE_MMAP) mmap_cache.emplace(sst_path, MappedFile(sst_path));
+                index_cache[sst_path] = index; // copy -- the shard loop below still needs `index`
+                delcol_cache[sst_path] = std::move(del_bits);
+                // A freshly flushed generation is always the newest by
+                // construction, so it belongs at the end -- no sort
+                // needed. (Recency is tracked purely by vector position,
+                // not by filename/sequence value, so that compaction's
+                // merged files -- which get a fresh, unrelated sequence
+                // number but must stay logically oldest -- can't ever get
+                // scrambled out of place by re-sorting.)
+                sstable_files.push_back(sst_path);
+                Manifest::add_entry(data_dir, format_seq(seq) + ".sst", seq);
+            }
 
-            uint64_t next_seq = current_seq + 1;
+            uint32_t this_file_seq = static_cast<uint32_t>(seq);
+            for (const auto& entry : index) {
+                std::unique_lock slock(shard_locks[shard_for(entry.key)]);
+                global_key_index[shard_for(entry.key)][entry.key] =
+                    Location{this_file_seq, static_cast<uint32_t>(entry.serial)};
+            }
+
+            uint64_t next_seq = seq + 1;
             std::string next_wal_path = get_wal_path(next_seq);
             wal = std::make_unique<WAL>(next_wal_path);
 
             memtable.clear();
-            current_seq = next_seq;
 
-            // A freshly flushed generation is always the newest by
-            // construction, so it belongs at the end -- no sort needed.
-            // (Recency is tracked purely by vector position, not by
-            // filename/sequence value, so that compaction's merged files
-            // -- which get a fresh, unrelated sequence number but must
-            // stay logically oldest -- can't ever get scrambled out of
-            // place by re-sorting.)
-            sstable_files.push_back(sst_path);
-
-            std::cout << "--- Flush Complete. Generation is now: " << current_seq << " ---" << std::endl;
+            std::cout << "--- Flush Complete. Generation is now: " << current_seq.load() << " ---" << std::endl;
         }
     }
 
@@ -343,14 +500,17 @@ struct StorageEngine::Impl {
     // The slow part -- reading both files, merging, writing the new one --
     // holds NO lock, since SSTables are immutable once written and reading
     // one is safe to interleave with anything. Only the brief metadata
-    // swap at the end takes rw_lock's unique_lock, same as a normal flush.
+    // swap at the end takes files_lock exclusively, plus per-key shard
+    // locks (sequentially, never nested with files_lock -- see the
+    // struct-level lock-ordering comment). Never touches memtable_lock at
+    // all -- compaction doesn't read or write the memtable.
     bool compact_once() {
         std::lock_guard<std::mutex> serialize(compaction_serialize_mutex_);
 
         std::string path_a, path_b;
         std::vector<uint8_t> del_a_snapshot, del_b_snapshot;
         {
-            std::shared_lock lock(rw_lock);
+            std::shared_lock flock(files_lock);
             if (sstable_files.size() < 3) return false;
             path_a = sstable_files[0]; // older
             path_b = sstable_files[1]; // newer
@@ -374,11 +534,6 @@ struct StorageEngine::Impl {
         }
 
         // --- Slow phase: no lock held ---
-        // Streams one record at a time from each input file rather than
-        // loading either fully into memory (peak memory here is O(1) per
-        // input file, not O(file size)). Uses the del-bitmap SNAPSHOTS
-        // taken above, not the live cache -- see the staleness check below
-        // for why that matters.
         std::string tmp_path = (std::filesystem::path(data_dir) / "compact.tmp").string();
         std::vector<IndexEntry> merged_index;
         std::vector<uint8_t> merged_del;
@@ -391,102 +546,125 @@ struct StorageEngine::Impl {
         }
         bool wrote_file = !merged_index.empty();
 
-        // --- Swap phase: brief unique_lock for in-memory + Manifest only ---
-        std::unique_lock lock(rw_lock);
-
-        // A concurrent Put/Delete may have marked a record in path_a or
-        // path_b dead WHILE the slow merge above was working from a
-        // snapshot of their del-bitmaps taken before it started -- if so,
-        // the merge may have copied forward a record that's actually dead
-        // now, which would silently resurrect a stale value if committed.
-        // Detect this by comparing the live del-bitmaps against the
-        // snapshot; if either changed, discard this merge's result and
-        // retry from scratch on the next pass rather than risk committing
-        // a merge computed from stale liveness data.
-        auto still_matches = [this](const std::string& path, const std::vector<uint8_t>& snapshot) {
-            auto it = delcol_cache.find(path);
-            const std::vector<uint8_t>& live = (it != delcol_cache.end()) ? it->second : std::vector<uint8_t>{};
-            return live == snapshot;
-        };
-        if (!still_matches(path_a, del_a_snapshot) || !still_matches(path_b, del_b_snapshot)) {
-            lock.unlock();
-            if (wrote_file) std::filesystem::remove(tmp_path);
-            return false;
-        }
-
-        if (!wrote_file) {
-            // Both generations fully cancelled out (every key ended up
-            // deleted or shadowed) -- discard the empty temp file rather
-            // than registering a pointless empty generation; the pair just
-            // vanishes with no replacement.
-            std::filesystem::remove(tmp_path);
-        }
-
+        // --- Swap phase: files_lock only; shard updates happen after it's released ---
         std::string final_path;
-        if (wrote_file) {
-            uint64_t merged_seq = current_seq++;
-            final_path = get_sst_path(merged_seq);
-            // Fresh, never-before-used sequence number -> this rename can
-            // never collide with or overwrite any live file.
-            std::filesystem::rename(tmp_path, final_path);
-            if (USE_MMAP) mmap_cache.emplace(final_path, MappedFile(final_path));
-            SSTable::save_del_bitmap(SSTable::del_path_for(final_path), merged_del);
-            delcol_cache[final_path] = std::move(merged_del);
+        uint32_t merged_file_seq = 0;
+        bool committed_new_file = false;
+        {
+            std::unique_lock flock(files_lock);
 
-            // Every surviving record gets a FRESH serial in the merged
-            // file, so (unlike Put/Delete) this can't rely on
-            // global_key_index already being correct for these keys --
-            // each one needs its entry rewritten to point at the new
-            // file+serial directly. Entries for the merged-away files' now
-            // fully-dead keys need no cleanup here: they were already
-            // erased when they died, via mark_dead, potentially
-            // generations before this compaction pass ever ran.
-            uint32_t merged_file_seq = static_cast<uint32_t>(merged_seq);
+            // A concurrent Put/Delete may have marked a record in path_a
+            // or path_b dead WHILE the slow merge above was working from a
+            // snapshot of their del-bitmaps taken before it started -- if
+            // so, the merge may have copied forward a record that's
+            // actually dead now, which would silently resurrect a stale
+            // value if committed. Detect this by comparing the live
+            // del-bitmaps against the snapshot; if either changed, discard
+            // this merge's result and retry from scratch on the next pass
+            // rather than risk committing a merge computed from stale
+            // liveness data.
+            auto still_matches = [this](const std::string& path, const std::vector<uint8_t>& snapshot) {
+                auto it = delcol_cache.find(path);
+                const std::vector<uint8_t>& live = (it != delcol_cache.end()) ? it->second : std::vector<uint8_t>{};
+                return live == snapshot;
+            };
+            if (!still_matches(path_a, del_a_snapshot) || !still_matches(path_b, del_b_snapshot)) {
+                flock.unlock();
+                if (wrote_file) {
+                    std::error_code ec;
+                    std::filesystem::remove(tmp_path, ec);
+                }
+                return false;
+            }
+
+            if (!wrote_file) {
+                // Both generations fully cancelled out (every key ended up
+                // deleted or shadowed) -- discard the empty temp file
+                // rather than registering a pointless empty generation;
+                // the pair just vanishes with no replacement.
+                std::error_code ec;
+                std::filesystem::remove(tmp_path, ec);
+            } else {
+                uint64_t merged_seq = current_seq.fetch_add(1);
+                merged_file_seq = static_cast<uint32_t>(merged_seq);
+                final_path = get_sst_path(merged_seq);
+                // Fresh, never-before-used sequence number -> this rename
+                // can never collide with or overwrite any live file.
+                std::filesystem::rename(tmp_path, final_path);
+                if (USE_MMAP) mmap_cache.emplace(final_path, MappedFile(final_path));
+                SSTable::save_del_bitmap(SSTable::del_path_for(final_path), merged_del);
+                delcol_cache[final_path] = std::move(merged_del);
+                // Copy (not move) merged_index here -- the shard-update
+                // loop below still needs it, and that loop must run
+                // outside this files_lock hold (never nesting files_lock
+                // with shard_locks).
+                index_cache[final_path] = merged_index;
+                committed_new_file = true;
+            }
+
+            sstable_files.erase(sstable_files.begin(), sstable_files.begin() + 2);
+            index_cache.erase(path_a);
+            index_cache.erase(path_b);
+            delcol_cache.erase(path_a);
+            delcol_cache.erase(path_b);
+            mmap_cache.erase(path_a);
+            mmap_cache.erase(path_b);
+            if (committed_new_file) {
+                // Still logically the oldest survivor -- position, not the
+                // (fresh, numerically large) sequence number, is what
+                // matters.
+                sstable_files.insert(sstable_files.begin(), final_path);
+            }
+
+            // Durable commit point: rewrite the whole Manifest to match
+            // the just-updated sstable_files exactly, in order. Must
+            // happen AFTER the rename above -- if it happened first and we
+            // crashed before the rename, the Manifest would reference a
+            // file that doesn't physically exist yet, losing both source
+            // generations' data. Doing the rename first means a crash
+            // before this point just leaves a harmless orphaned temp file.
+            std::vector<ManifestEntry> entries;
+            entries.reserve(sstable_files.size());
+            for (const auto& p : sstable_files) {
+                entries.push_back({std::filesystem::path(p).filename().string(), parse_seq_from_path(p)});
+            }
+            Manifest::rewrite(data_dir, entries);
+        }
+
+        // Every surviving record gets a FRESH serial in the merged file,
+        // so (unlike Put/Delete) this can't rely on global_key_index
+        // already being correct for these keys -- each one needs its
+        // entry rewritten to point at the new file+serial directly.
+        // Entries for the merged-away files' now fully-dead keys need no
+        // cleanup here: they were already erased when they died, via
+        // mark_dead, potentially generations before this compaction pass
+        // ever ran.
+        if (committed_new_file) {
             for (const auto& entry : merged_index) {
+                std::unique_lock slock(shard_locks[shard_for(entry.key)]);
                 global_key_index[shard_for(entry.key)][entry.key] =
                     Location{merged_file_seq, static_cast<uint32_t>(entry.serial)};
             }
-            index_cache[final_path] = std::move(merged_index);
         }
-
-        sstable_files.erase(sstable_files.begin(), sstable_files.begin() + 2);
-        index_cache.erase(path_a);
-        index_cache.erase(path_b);
-        delcol_cache.erase(path_a);
-        delcol_cache.erase(path_b);
-        mmap_cache.erase(path_a);
-        mmap_cache.erase(path_b);
-        if (wrote_file) {
-            // Still logically the oldest survivor -- position, not the
-            // (fresh, numerically large) sequence number, is what matters.
-            sstable_files.insert(sstable_files.begin(), final_path);
-        }
-
-        // Durable commit point: rewrite the whole Manifest to match the
-        // just-updated sstable_files exactly, in order. Must happen AFTER
-        // the rename above -- if it happened first and we crashed before
-        // the rename, the Manifest would reference a file that doesn't
-        // physically exist yet, losing both source generations' data.
-        // Doing the rename first means a crash before this point just
-        // leaves a harmless orphaned temp file.
-        std::vector<ManifestEntry> entries;
-        entries.reserve(sstable_files.size());
-        for (const auto& p : sstable_files) {
-            entries.push_back({std::filesystem::path(p).filename().string(), parse_seq_from_path(p)});
-        }
-        Manifest::rewrite(data_dir, entries);
-
-        lock.unlock();
 
         // Physically delete the two old files now that the Manifest no
-        // longer references them. Safe outside the lock and after
-        // everything above -- nothing reads them anymore; a crash before
-        // this point just leaves harmless orphaned files on disk, never
-        // data loss.
-        std::filesystem::remove(path_a);
-        std::filesystem::remove(path_b);
-        std::filesystem::remove(SSTable::del_path_for(path_a));
-        std::filesystem::remove(SSTable::del_path_for(path_b));
+        // longer references them. Safe outside any lock and after
+        // everything above -- nothing reads them anymore in the sense
+        // that matters (no live SSTable-level cache still names them) --
+        // but a concurrent Get() already past that check may still have
+        // one open (e.g. mid-read via ifstream) when this runs, which
+        // some platforms (Windows in particular, unlike POSIX) refuse to
+        // delete out from under an open handle. Use the non-throwing
+        // overload and treat failure as a harmless orphan to clean up
+        // later, exactly like this codebase already tolerates elsewhere
+        // (e.g. leftover WAL segments after a flush) -- a failed delete
+        // here is not a correctness problem, since the Manifest already
+        // durably stopped referencing these files.
+        std::error_code ec;
+        std::filesystem::remove(path_a, ec);
+        std::filesystem::remove(path_b, ec);
+        std::filesystem::remove(SSTable::del_path_for(path_a), ec);
+        std::filesystem::remove(SSTable::del_path_for(path_b), ec);
 
         return true;
     }
@@ -520,21 +698,22 @@ struct StorageEngine::Impl {
         compaction_thread_.join();
     }
 
-    // Snapshots global_key_index to disk. Copies it under a brief
-    // shared_lock (consistent with how compact_once() snapshots
-    // del-bitmaps before its own slow phase), then does the actual disk
-    // write outside any lock, so a large index doesn't hold up concurrent
-    // Put/Delete/Get for the duration of the write -- only for the copy.
+    // Snapshots global_key_index to disk, one shard at a time (each
+    // shard's lock held only briefly, for its own copy) rather than one
+    // lock covering the whole structure at once -- slightly weaker
+    // snapshot consistency (the shards are no longer copied atomically as
+    // one point-in-time view), acceptable since the checkpoint is already
+    // explicitly designed to tolerate staleness. The actual disk write
+    // then happens outside any lock.
     bool checkpoint_index_once() {
         std::lock_guard<std::mutex> serialize(checkpoint_serialize_mutex_);
 
         ShardedIndex snapshot;
-        uint64_t seq_marker;
-        {
-            std::shared_lock lock(rw_lock);
-            snapshot = global_key_index;
-            seq_marker = current_seq;
+        for (size_t i = 0; i < kNumShards; ++i) {
+            std::shared_lock slock(shard_locks[i]);
+            snapshot[i] = global_key_index[i];
         }
+        uint64_t seq_marker = current_seq.load();
         IndexCheckpoint::write(data_dir, seq_marker, snapshot);
         return true;
     }
@@ -573,15 +752,15 @@ struct StorageEngine::Impl {
 StorageEngine::StorageEngine(const std::string& data_dir, size_t memtable_threshold, bool use_mmap_reads)
     : pImpl(std::make_unique<Impl>(data_dir, memtable_threshold, use_mmap_reads)) {
     std::cout << "Engine initialized at: " << data_dir
-              << " | Active Sequence: " << pImpl->current_seq << std::endl;
+              << " | Active Sequence: " << pImpl->current_seq.load() << std::endl;
 }
 
 StorageEngine::~StorageEngine() = default;
 
 bool StorageEngine::Put(const std::string& key, const std::string& value) {
-    std::unique_lock lock(pImpl->rw_lock);
+    std::unique_lock lock(pImpl->memtable_lock);
 
-    if (!pImpl->wal->append(LogOp::PUT, pImpl->current_seq, key, value)) {
+    if (!pImpl->wal->append(LogOp::PUT, pImpl->current_seq.load(), key, value)) {
         return false;
     }
 
@@ -594,33 +773,40 @@ bool StorageEngine::Put(const std::string& key, const std::string& value) {
     return true;
 }
 
-// --- NEW PUBLIC FORCE FLUSH ---
 void StorageEngine::ForceFlush() {
-    std::unique_lock lock(pImpl->rw_lock);
+    std::unique_lock lock(pImpl->memtable_lock);
     pImpl->flush();
 }
 
 std::optional<std::string> StorageEngine::Get(const std::string& key) {
-    std::shared_lock lock(pImpl->rw_lock);
-
-    auto it = pImpl->memtable.find(key);
-    if (it != pImpl->memtable.end()) {
-        return it->second;
+    {
+        std::shared_lock lock(pImpl->memtable_lock);
+        auto it = pImpl->memtable.find(key);
+        if (it != pImpl->memtable.end()) {
+            return it->second;
+        }
     }
 
     // Fast path: global_key_index gives an O(1) candidate location instead
     // of scanning every live generation newest-to-oldest. A dead candidate
     // falls through to the slow path below rather than being trusted --
-    // Get() only holds a shared_lock, so unlike find_live_location it can't
-    // self-heal a stale entry itself (that happens lazily, the next time a
-    // Put/Delete touches this key, under the unique_lock).
-    auto& shard = pImpl->global_key_index[Impl::shard_for(key)];
-    auto gi_it = shard.find(key);
-    if (gi_it != shard.end()) {
-        std::string file = pImpl->get_sst_path(gi_it->second.file_seq);
+    // Get() can't self-heal a stale entry itself (that happens lazily, the
+    // next time find_live_location touches this key). The shard lock and
+    // files_lock are acquired and released sequentially here too, never
+    // nested, matching the rest of this file.
+    size_t shard = Impl::shard_for(key);
+    std::optional<Location> maybe_loc;
+    {
+        std::shared_lock slock(pImpl->shard_locks[shard]);
+        auto gi_it = pImpl->global_key_index[shard].find(key);
+        if (gi_it != pImpl->global_key_index[shard].end()) maybe_loc = gi_it->second;
+    }
+    if (maybe_loc) {
+        std::string file = pImpl->get_sst_path(maybe_loc->file_seq);
+        std::shared_lock flock(pImpl->files_lock);
         auto del_it = pImpl->delcol_cache.find(file);
         bool dead = del_it != pImpl->delcol_cache.end() &&
-                    SSTable::is_dead(del_it->second, gi_it->second.serial);
+                    SSTable::is_dead(del_it->second, maybe_loc->serial);
         if (!dead) {
             auto result = pImpl->search_one_file(file, key);
             if (result.found) return result.value;
@@ -634,6 +820,7 @@ std::optional<std::string> StorageEngine::Get(const std::string& key) {
     // del-bitmap before trusting the value -- a set bit means this record
     // has since been superseded or deleted, so keep searching older
     // generations exactly as a tombstone used to make this loop do.
+    std::shared_lock flock(pImpl->files_lock);
     for (auto rit = pImpl->sstable_files.rbegin(); rit != pImpl->sstable_files.rend(); ++rit) {
         auto result = pImpl->search_one_file(*rit, key);
         if (result.found) {
@@ -647,9 +834,9 @@ std::optional<std::string> StorageEngine::Get(const std::string& key) {
 }
 
 bool StorageEngine::Delete(const std::string& key) {
-    std::unique_lock lock(pImpl->rw_lock);
+    std::unique_lock lock(pImpl->memtable_lock);
 
-    if (!pImpl->wal->append(LogOp::DELETE, pImpl->current_seq, key, "")) {
+    if (!pImpl->wal->append(LogOp::DELETE, pImpl->current_seq.load(), key, "")) {
         return false;
     }
 
