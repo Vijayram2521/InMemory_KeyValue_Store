@@ -77,57 +77,62 @@ void kv_tests::run_test_compaction() {
                  "The newest generation's own file is never renamed/removed by compaction");
     }
 
-    // 3. Deleted-key reclamation: the critical correctness case -- the
-    // tombstone must be fully dropped, not carried forward, and Get must
-    // still correctly report the key as deleted afterward. "d" is the only
-    // key in the oldest pair, so the merge produces zero surviving records
-    // -- exercising the "both generations fully cancel out" path too:
-    // 3 generations become 1 (2 removed, 0 replacement written), not 2.
+    // 3. Deleted-key reclamation, both-fully-dead case: under eager
+    // dead-marking, Delete() flips the target's bit in whichever file
+    // currently holds it immediately -- it doesn't write anything to the
+    // memtable, so it produces no generation of its own (ForceFlush is a
+    // no-op on an empty memtable). Here "d" is overwritten (marking
+    // generation 0's copy dead) and then the overwritten copy is itself
+    // deleted (marking generation 1's copy dead too), so by the time
+    // compaction runs, BOTH generations in the oldest pair are already
+    // fully dead -- exercising the "both generations fully cancel out"
+    // path: 3 generations become 1 (2 removed, 0 replacement written).
     {
         std::string path = "./TestStorage/test_compaction_delete";
         cleanup_test_dir(path);
         kv_engine::StorageEngine engine(path);
-        engine.Put("d", "v");
-        engine.ForceFlush(); // generation 0: PUT d
-        engine.Delete("d");
-        engine.ForceFlush(); // generation 1: tombstone for d
+        engine.Put("d", "v1");
+        engine.ForceFlush(); // generation 0: PUT d=v1
+        engine.Put("d", "v2"); // eagerly marks generation 0's "d" dead
+        engine.ForceFlush(); // generation 1: PUT d=v2
+        engine.Delete("d"); // eagerly marks generation 1's "d" dead; memtable stays empty
         engine.Put("sentinel", "x");
         engine.ForceFlush(); // generation 2 -- untouched
 
-        KV_CHECK(engine.CompactOnce(), "CompactOnce merges the PUT+tombstone pair");
+        KV_CHECK(engine.CompactOnce(), "CompactOnce merges a pair that is fully dead on both sides");
         KV_CHECK_EQ(size_t(1), count_sst_files(path),
-                    "A PUT+tombstone pair that cancels out entirely vanishes with no replacement file "
+                    "A pair that is fully dead on both sides vanishes with no replacement file "
                     "(3 generations -> 1, not 2)");
 
         KV_CHECK_FALSE(engine.Get("d").has_value(),
-                        "Deleted key still correctly reports absent after its tombstone is compacted away");
+                        "Deleted key still correctly reports absent after its dead pair is compacted away");
         auto sentinel = engine.Get("sentinel");
         KV_CHECK(sentinel.has_value() && *sentinel == "x",
                  "Untouched newest generation's key still reads correctly");
     }
 
     // 3b. Deleted-key reclamation where the pair does NOT fully cancel out
-    // -- a surviving PUT alongside the dropped tombstone, so the merge
+    // -- one dead record dropped alongside one surviving key, so the merge
     // output is non-empty and a real replacement file IS written.
     {
         std::string path = "./TestStorage/test_compaction_delete_partial";
         cleanup_test_dir(path);
         kv_engine::StorageEngine engine(path);
         engine.Put("d", "v");
+        engine.ForceFlush(); // generation 0: PUT d
+        engine.Delete("d"); // eagerly marks generation 0's "d" dead; memtable stays empty
         engine.Put("keep", "still_here");
-        engine.ForceFlush(); // generation 0: PUT d, PUT keep
-        engine.Delete("d");
-        engine.ForceFlush(); // generation 1: tombstone for d
+        engine.ForceFlush(); // generation 1: PUT keep
         engine.Put("sentinel", "x");
         engine.ForceFlush(); // generation 2 -- untouched
 
-        KV_CHECK(engine.CompactOnce(), "CompactOnce merges a pair with one surviving key and one dropped tombstone");
+        KV_CHECK(engine.CompactOnce(), "CompactOnce merges a pair with one dead record and one surviving key");
         KV_CHECK_EQ(size_t(2), count_sst_files(path),
                     "3 generations become 2 when the merge still has a surviving key to write");
         KV_CHECK_FALSE(engine.Get("d").has_value(), "Deleted key stays deleted");
         auto keep = engine.Get("keep");
         KV_CHECK(keep.has_value() && *keep == "still_here",
-                 "A key untouched by the delete survives the merge alongside the dropped tombstone");
+                 "A key untouched by the delete survives the merge alongside the dropped dead record");
     }
 
     // 4. Repeated compaction converges: keep merging until nothing's left,

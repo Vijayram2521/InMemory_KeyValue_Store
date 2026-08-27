@@ -1,7 +1,5 @@
 #include "../include/engine/wal.h"
 #include <iostream>
-#include <map>
-#include <set>
 
 WAL::WAL(const std::string& filepath) : path(filepath) {
     // Open in append and binary mode
@@ -42,8 +40,7 @@ bool WAL::append(LogOp op, uint64_t sequence,const std::string& key, const std::
     }
 }
 
-// Update this in wal.h and wal.cpp
-void WAL::recover(std::map<std::string, std::string>& memtable, std::set<std::string>& tombstones) {
+void WAL::read_all(const std::function<void(LogOp, uint64_t, const std::string&, const std::string&)>& visit) {
     std::ifstream reader(path, std::ios::binary | std::ios::in);
     if (!reader || !reader.is_open()) return;
 
@@ -54,26 +51,21 @@ void WAL::recover(std::map<std::string, std::string>& memtable, std::set<std::st
 
         if (!reader.read(&type_raw, sizeof(type_raw))) break;
         LogOp op = static_cast<LogOp>(type_raw);
-        
-        // Read the sequence we added earlier
+
         if (!reader.read(reinterpret_cast<char*>(&sequence), sizeof(sequence))) break;
-        
-        // Read Key
+
         if (!reader.read(reinterpret_cast<char*>(&kLen), sizeof(kLen))) break;
         std::string key(kLen, '\0');
-        reader.read(&key[0], kLen);
+        if (kLen > 0 && !reader.read(&key[0], kLen)) break;
 
         if (op == LogOp::PUT) {
             uint32_t vLen;
             if (!reader.read(reinterpret_cast<char*>(&vLen), sizeof(vLen))) break;
             std::string value(vLen, '\0');
-            reader.read(&value[0], vLen);
-            
-            memtable[key] = value; 
-            tombstones.erase(key); // If it was previously deleted, a new PUT revives it
+            if (vLen > 0 && !reader.read(&value[0], vLen)) break;
+            visit(op, sequence, key, value);
         } else if (op == LogOp::DELETE) {
-            memtable.erase(key);    // Remove from RAM
-            tombstones.insert(key); // Add to the "Death Row" for the next flush
+            visit(op, sequence, key, "");
         }
     }
 }

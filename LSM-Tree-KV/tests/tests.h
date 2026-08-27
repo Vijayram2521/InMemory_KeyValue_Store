@@ -14,6 +14,7 @@ namespace kv_tests {
     void run_test_wal();
     void run_test_sstable();
     void run_test_sstable_index();
+    void run_test_del_bitmap();
     void run_test_bloom_filter();
     void run_test_tombstone();
     void run_test_manifest();

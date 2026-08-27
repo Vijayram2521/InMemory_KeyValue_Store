@@ -20,6 +20,9 @@ int main() {
         kv_tests::run_test_sstable_index();
         std::cout << std::endl;
 
+        kv_tests::run_test_del_bitmap();
+        std::cout << std::endl;
+
         kv_tests::run_test_bloom_filter();
         std::cout << std::endl;
 

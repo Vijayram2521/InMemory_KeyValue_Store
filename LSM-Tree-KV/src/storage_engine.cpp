@@ -9,8 +9,6 @@
 #include <filesystem>
 #include <algorithm>
 #include "engine/sstable.h"
-#include "engine/bloom_filter.h"
-#include <set>
 #include <unordered_map>
 #include <chrono>
 #include <condition_variable>
@@ -50,19 +48,6 @@ uint64_t parse_seq_from_path(const std::string& path) {
 // follow-up, not implemented here -- this bounds the worst case instead.
 constexpr double kMaxOlderToNewerSizeRatio = 4.0;
 
-// Builds a Bloom filter sized for `index`'s key count and populated with
-// every key in it. Used both for freshly-flushed generations (which already
-// have their index in hand) and for generations recovered via the Manifest
-// at startup (whose index was just loaded from disk) -- either way, the
-// index already lists every key, so this never needs its own disk read.
-BloomFilter build_bloom_filter(const std::vector<IndexEntry>& index) {
-    BloomFilter bloom(index.size());
-    for (const auto& entry : index) {
-        bloom.add(entry.key);
-    }
-    return bloom;
-}
-
 struct StorageEngine::Impl {
     std::map<std::string, std::string> memtable;
     std::shared_mutex rw_lock;
@@ -70,7 +55,6 @@ struct StorageEngine::Impl {
     uint64_t current_seq;
     std::string data_dir;
     std::vector<std::string> sstable_files;
-    std::set<std::string> tombstones;
     size_t THRESHOLD;
     // Every SSTable's index, keyed by its file path. Populated once here at
     // startup (for generations recovered via the Manifest) or immediately
@@ -80,11 +64,13 @@ struct StorageEngine::Impl {
     // always runs under Put()/Delete()'s unique_lock, so it's safe to
     // mutate here without extra locking.
     std::unordered_map<std::string, std::vector<IndexEntry>> index_cache;
-    // Same lifecycle/locking rationale as index_cache above: populated once
-    // at startup or flush(), read-only from Get(). One Bloom filter per
-    // SSTable lets a lookup rule out "definitely not in this file" without
-    // ever opening it -- see bloom_filter.h for how it's built.
-    std::unordered_map<std::string, BloomFilter> bloom_cache;
+    // Same lifecycle/locking rationale as index_cache above: one del-bitmap
+    // per SSTable, mirroring the on-disk .del file, mutated in place (both
+    // here and on disk) whenever a record in that file is superseded or
+    // deleted -- see find_live_location/mark_dead below. This is what lets
+    // "dead" be known eagerly at write time rather than discovered lazily
+    // at merge time.
+    std::unordered_map<std::string, std::vector<uint8_t>> delcol_cache;
 
     // Experimental (see StorageEngine's use_mmap_reads doc comment). Only
     // ever populated when USE_MMAP is true -- left empty and untouched
@@ -111,8 +97,8 @@ struct StorageEngine::Impl {
             std::string full_path = (std::filesystem::path(data_dir) / entry.filename).string();
             sstable_files.push_back(full_path);
             auto index = SSTable::load_index(full_path);
-            bloom_cache.emplace(full_path, build_bloom_filter(index));
             if (USE_MMAP) mmap_cache.emplace(full_path, MappedFile(full_path));
+            delcol_cache[full_path] = SSTable::load_del_bitmap(SSTable::del_path_for(full_path));
             index_cache[full_path] = std::move(index);
         }
         // Deliberately the MAX sequence across all entries, not the last
@@ -130,7 +116,19 @@ struct StorageEngine::Impl {
 
         std::string wal_path = get_wal_path(current_seq);
         wal = std::make_unique<WAL>(wal_path);
-        wal->recover(memtable, tombstones);
+
+        // Replay: redo each PUT/DELETE through the SAME apply_put/
+        // apply_delete logic live Put()/Delete() use below, so recovery
+        // correctly re-runs eager dead-marking (find the key's prior
+        // on-disk location and flip its bit) rather than just repopulating
+        // the memtable. A dead-bit flip that didn't make it to disk before
+        // a crash is exactly what this replay exists to redo -- sstable
+        // state is already loaded above, so find_live_location has
+        // everything it needs.
+        wal->read_all([this](LogOp op, uint64_t /*seq*/, const std::string& key, const std::string& value) {
+            if (op == LogOp::PUT) apply_put(key, value);
+            else if (op == LogOp::DELETE) apply_delete(key);
+        });
     }
 
     std::string get_wal_path(uint64_t seq) {
@@ -140,41 +138,91 @@ struct StorageEngine::Impl {
         return (std::filesystem::path(data_dir) / (format_seq(seq) + ".sst")).string();
     }
 
-    // --- NEW DEDICATED FLUSH METHOD ---
+    struct Location {
+        std::string file;
+        uint64_t serial;
+    };
+
+    // Searches every live SSTable, newest to oldest, for `key`'s current
+    // on-disk position -- the same search order Get() uses. Skips any
+    // match already marked dead and keeps searching older generations
+    // (defensive: under the eager-marking invariant this should never
+    // actually be reachable in normal operation, since a dead record's
+    // supersession is proven at write time, but this way a violated
+    // invariant degrades to "search a bit further" rather than "return the
+    // wrong answer"). Callers must hold at least a shared_lock.
+    std::optional<Location> find_live_location(const std::string& key) {
+        for (auto rit = sstable_files.rbegin(); rit != sstable_files.rend(); ++rit) {
+            auto cache_it = index_cache.find(*rit);
+            if (cache_it == index_cache.end()) continue;
+            auto it = std::lower_bound(cache_it->second.begin(), cache_it->second.end(), key,
+                [](const IndexEntry& e, const std::string& k) { return e.key < k; });
+            if (it != cache_it->second.end() && it->key == key) {
+                auto del_it = delcol_cache.find(*rit);
+                bool dead = del_it != delcol_cache.end() && SSTable::is_dead(del_it->second, it->serial);
+                if (!dead) return Location{*rit, it->serial};
+            }
+        }
+        return std::nullopt;
+    }
+
+    // Flips a record's bit both in the resident cache and on disk. Callers
+    // must hold the unique_lock (all callers here are apply_put/
+    // apply_delete, which already require it).
+    void mark_dead(const Location& loc) {
+        auto del_it = delcol_cache.find(loc.file);
+        if (del_it != delcol_cache.end()) {
+            SSTable::mark_dead_in_memory(del_it->second, loc.serial);
+        }
+        SSTable::flip_dead_on_disk(SSTable::del_path_for(loc.file), loc.serial);
+    }
+
+    // Core Put/Delete logic, shared between live calls and WAL replay
+    // during recovery -- callers are responsible for the WAL append (live
+    // calls do it before calling these; replay already has a durable WAL
+    // entry it's redoing). Requires the unique_lock (held by Put/Delete,
+    // or implicitly single-threaded during construction).
+    void apply_put(const std::string& key, const std::string& value) {
+        auto loc = find_live_location(key);
+        if (loc) mark_dead(*loc);
+        memtable[key] = value;
+    }
+
+    void apply_delete(const std::string& key) {
+        memtable.erase(key);
+        auto loc = find_live_location(key);
+        if (loc) mark_dead(*loc);
+    }
+
     void flush() {
-        // Check both: we might have an empty memtable but pending tombstones
-        if (memtable.empty() && tombstones.empty()) return;
+        if (memtable.empty()) return;
 
         std::string sst_path = get_sst_path(current_seq);
         std::cout << "--- Persisting Generation " << current_seq << " to Disk ---" << std::endl;
 
-        // 1. Write the SSTable (data + index + footer) using both the map
-        // and the tombstone set, capturing the index built while writing so
-        // we can cache it directly without re-reading the file.
         std::vector<IndexEntry> index;
-        if (SSTable::write_file(sst_path, memtable, tombstones, index)) {
-            bloom_cache.emplace(sst_path, build_bloom_filter(index));
+        if (SSTable::write_file(sst_path, memtable, index)) {
             if (USE_MMAP) mmap_cache.emplace(sst_path, MappedFile(sst_path));
             index_cache[sst_path] = std::move(index);
 
-            // 2. Register the new file in the Manifest
-            // This persists the filename and the current "timestamp"
+            // Del-bitmap sized to the flush threshold (the "flush key
+            // limit"), not the actual record count -- most bits stay
+            // unused if fewer than THRESHOLD keys were flushed (e.g. via
+            // ForceFlush), which is harmless.
+            auto del_bits = SSTable::make_del_bitmap(THRESHOLD);
+            SSTable::save_del_bitmap(SSTable::del_path_for(sst_path), del_bits);
+            delcol_cache[sst_path] = std::move(del_bits);
+
             Manifest::add_entry(data_dir, format_seq(current_seq) + ".sst", current_seq);
 
-            // 3. Prepare for the next generation
             uint64_t next_seq = current_seq + 1;
             std::string next_wal_path = get_wal_path(next_seq);
-            
-            // Rotate WAL: Old logs are now redundant because data is in the .sst
             wal = std::make_unique<WAL>(next_wal_path);
-            
-            // 4. Reset in-memory state
+
             memtable.clear();
-            tombstones.clear(); 
             current_seq = next_seq;
 
-            // 5. Update the live file list for "First Hit" searching. A
-            // freshly flushed generation is always the newest by
+            // A freshly flushed generation is always the newest by
             // construction, so it belongs at the end -- no sort needed.
             // (Recency is tracked purely by vector position, not by
             // filename/sequence value, so that compaction's merged files
@@ -199,11 +247,16 @@ struct StorageEngine::Impl {
         std::lock_guard<std::mutex> serialize(compaction_serialize_mutex_);
 
         std::string path_a, path_b;
+        std::vector<uint8_t> del_a_snapshot, del_b_snapshot;
         {
             std::shared_lock lock(rw_lock);
             if (sstable_files.size() < 3) return false;
             path_a = sstable_files[0]; // older
             path_b = sstable_files[1]; // newer
+            auto it_a = delcol_cache.find(path_a);
+            auto it_b = delcol_cache.find(path_b);
+            del_a_snapshot = (it_a != delcol_cache.end()) ? it_a->second : std::vector<uint8_t>{};
+            del_b_snapshot = (it_b != delcol_cache.end()) ? it_b->second : std::vector<uint8_t>{};
         }
 
         // Size-ratio gate -- see kMaxOlderToNewerSizeRatio's comment above.
@@ -222,20 +275,44 @@ struct StorageEngine::Impl {
         // --- Slow phase: no lock held ---
         // Streams one record at a time from each input file rather than
         // loading either fully into memory (peak memory here is O(1) per
-        // input file, not O(file size)) -- the original load-both-files-
-        // fully approach genuinely OOM-killed memory-constrained deployments
-        // (observed directly: 1.2GB-capped compute node containers killed
-        // by the kernel cgroup OOM killer while holding two full files'
-        // records plus a merged copy simultaneously).
+        // input file, not O(file size)). Uses the del-bitmap SNAPSHOTS
+        // taken above, not the live cache -- see the staleness check below
+        // for why that matters.
         std::string tmp_path = (std::filesystem::path(data_dir) / "compact.tmp").string();
         std::vector<IndexEntry> merged_index;
-        if (!SSTable::merge_files(path_a, path_b, tmp_path, merged_index)) {
+        std::vector<uint8_t> merged_del;
+        if (!SSTable::merge_files(path_a, del_a_snapshot, path_b, del_b_snapshot,
+                                   tmp_path, merged_index, merged_del)) {
             // Couldn't write the merged file -- abort without touching any
             // live state. Old generations are untouched; try again on the
             // next pass.
             return false;
         }
         bool wrote_file = !merged_index.empty();
+
+        // --- Swap phase: brief unique_lock for in-memory + Manifest only ---
+        std::unique_lock lock(rw_lock);
+
+        // A concurrent Put/Delete may have marked a record in path_a or
+        // path_b dead WHILE the slow merge above was working from a
+        // snapshot of their del-bitmaps taken before it started -- if so,
+        // the merge may have copied forward a record that's actually dead
+        // now, which would silently resurrect a stale value if committed.
+        // Detect this by comparing the live del-bitmaps against the
+        // snapshot; if either changed, discard this merge's result and
+        // retry from scratch on the next pass rather than risk committing
+        // a merge computed from stale liveness data.
+        auto still_matches = [this](const std::string& path, const std::vector<uint8_t>& snapshot) {
+            auto it = delcol_cache.find(path);
+            const std::vector<uint8_t>& live = (it != delcol_cache.end()) ? it->second : std::vector<uint8_t>{};
+            return live == snapshot;
+        };
+        if (!still_matches(path_a, del_a_snapshot) || !still_matches(path_b, del_b_snapshot)) {
+            lock.unlock();
+            if (wrote_file) std::filesystem::remove(tmp_path);
+            return false;
+        }
+
         if (!wrote_file) {
             // Both generations fully cancelled out (every key ended up
             // deleted or shadowed) -- discard the empty temp file rather
@@ -244,9 +321,6 @@ struct StorageEngine::Impl {
             std::filesystem::remove(tmp_path);
         }
 
-        // --- Swap phase: brief unique_lock for in-memory + Manifest only ---
-        std::unique_lock lock(rw_lock);
-
         std::string final_path;
         if (wrote_file) {
             uint64_t merged_seq = current_seq++;
@@ -254,16 +328,17 @@ struct StorageEngine::Impl {
             // Fresh, never-before-used sequence number -> this rename can
             // never collide with or overwrite any live file.
             std::filesystem::rename(tmp_path, final_path);
-            bloom_cache.emplace(final_path, build_bloom_filter(merged_index));
             if (USE_MMAP) mmap_cache.emplace(final_path, MappedFile(final_path));
+            SSTable::save_del_bitmap(SSTable::del_path_for(final_path), merged_del);
+            delcol_cache[final_path] = std::move(merged_del);
             index_cache[final_path] = std::move(merged_index);
         }
 
         sstable_files.erase(sstable_files.begin(), sstable_files.begin() + 2);
         index_cache.erase(path_a);
         index_cache.erase(path_b);
-        bloom_cache.erase(path_a);
-        bloom_cache.erase(path_b);
+        delcol_cache.erase(path_a);
+        delcol_cache.erase(path_b);
         mmap_cache.erase(path_a);
         mmap_cache.erase(path_b);
         if (wrote_file) {
@@ -295,6 +370,8 @@ struct StorageEngine::Impl {
         // data loss.
         std::filesystem::remove(path_a);
         std::filesystem::remove(path_b);
+        std::filesystem::remove(SSTable::del_path_for(path_a));
+        std::filesystem::remove(SSTable::del_path_for(path_b));
 
         return true;
     }
@@ -335,7 +412,7 @@ struct StorageEngine::Impl {
 
 StorageEngine::StorageEngine(const std::string& data_dir, size_t memtable_threshold, bool use_mmap_reads)
     : pImpl(std::make_unique<Impl>(data_dir, memtable_threshold, use_mmap_reads)) {
-    std::cout << "Engine initialized at: " << data_dir 
+    std::cout << "Engine initialized at: " << data_dir
               << " | Active Sequence: " << pImpl->current_seq << std::endl;
 }
 
@@ -343,15 +420,13 @@ StorageEngine::~StorageEngine() = default;
 
 bool StorageEngine::Put(const std::string& key, const std::string& value) {
     std::unique_lock lock(pImpl->rw_lock);
-    
-    if (!pImpl->wal->append(LogOp::PUT,pImpl->current_seq, key, value)) {
-        return false; 
-    }
-    
-    pImpl->memtable[key] = value;
-    pImpl->tombstones.erase(key); // A fresh PUT revives a previously deleted key
 
-    // Trigger flush if threshold reached
+    if (!pImpl->wal->append(LogOp::PUT, pImpl->current_seq, key, value)) {
+        return false;
+    }
+
+    pImpl->apply_put(key, value);
+
     if (pImpl->memtable.size() >= pImpl->THRESHOLD) {
         pImpl->flush();
     }
@@ -368,25 +443,16 @@ void StorageEngine::ForceFlush() {
 std::optional<std::string> StorageEngine::Get(const std::string& key) {
     std::shared_lock lock(pImpl->rw_lock);
 
-    if (pImpl->tombstones.count(key)) {
-        return std::nullopt; // It's dead, don't look further
-    }
-
     auto it = pImpl->memtable.find(key);
     if (it != pImpl->memtable.end()) {
         return it->second;
     }
 
-    // Search SSTables newest to oldest. The Bloom filter check first can
-    // only ever save work (a definite "not here" skips this file without
-    // opening it); if it says "maybe," fall through to the same binary
-    // search over the cached index plus a single seek+read on a hit -- no
-    // linear scan of the file either way.
+    // Search SSTables newest to oldest; on an index hit, check the file's
+    // del-bitmap before trusting the value -- a set bit means this record
+    // has since been superseded or deleted, so keep searching older
+    // generations exactly as a tombstone used to make this loop do.
     for (auto rit = pImpl->sstable_files.rbegin(); rit != pImpl->sstable_files.rend(); ++rit) {
-        auto bloom_it = pImpl->bloom_cache.find(*rit);
-        if (bloom_it != pImpl->bloom_cache.end() && !bloom_it->second.maybe_contains(key)) {
-            continue; // definitely not in this file
-        }
         auto cache_it = pImpl->index_cache.find(*rit);
         if (cache_it == pImpl->index_cache.end()) continue; // shouldn't happen; defensive
 
@@ -413,7 +479,9 @@ std::optional<std::string> StorageEngine::Get(const std::string& key) {
             result = SSTable::search_with_index(*rit, cache_it->second, key);
         }
         if (result.found) {
-            if (result.is_tombstone) return std::nullopt;
+            auto del_it = pImpl->delcol_cache.find(*rit);
+            bool dead = del_it != pImpl->delcol_cache.end() && SSTable::is_dead(del_it->second, result.serial);
+            if (dead) continue; // superseded/deleted -- try the next (older) generation
             return result.value;
         }
     }
@@ -423,19 +491,11 @@ std::optional<std::string> StorageEngine::Get(const std::string& key) {
 bool StorageEngine::Delete(const std::string& key) {
     std::unique_lock lock(pImpl->rw_lock);
 
-    // 1. Log the DELETE with the current sequence
     if (!pImpl->wal->append(LogOp::DELETE, pImpl->current_seq, key, "")) {
         return false;
     }
 
-    // 2. Update RAM state
-    pImpl->memtable.erase(key);
-    pImpl->tombstones.insert(key);
-
-    // 3. Optional: Trigger flush if tombstone count + memtable size is too high
-    if ((pImpl->memtable.size() + pImpl->tombstones.size()) >= pImpl->THRESHOLD) {
-        pImpl->flush();
-    }
+    pImpl->apply_delete(key);
 
     return true;
 }

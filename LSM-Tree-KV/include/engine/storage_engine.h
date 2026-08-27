@@ -18,7 +18,7 @@ namespace kv_engine {
              * they don't end up with one SSTable file per few writes.
              * @param use_mmap_reads Experimental, opt-in: when true, every
              * SSTable is mmap()'d once (at flush/load/compaction time,
-             * alongside the index and Bloom filter) and Get() reads directly
+             * alongside the index and del-bitmap) and Get() reads directly
              * from mapped memory instead of a fresh open()/seekg()/read()
              * per lookup. Default false leaves the original ifstream-based
              * read path unchanged, so this is purely opt-in for A/B testing.
@@ -44,8 +44,11 @@ namespace kv_engine {
             std::optional<std::string> Get(const std::string& key);
 
             /**
-             * Removes a key from the store. 
-             * Note: In LSM-trees, this is usually a "Tombstone" write.
+             * Removes a key from the store. Unlike a classic LSM-tree, this
+             * does not write a tombstone record: if the key currently has a
+             * live on-disk copy, its record is marked dead in place (see
+             * the del-bitmap mechanism); otherwise this is a no-op beyond
+             * the WAL entry (nothing to mark).
              */
             bool Delete(const std::string& key);
 
@@ -56,10 +59,10 @@ namespace kv_engine {
 
             /**
              * Runs one compaction pass synchronously: merges the two oldest
-             * flushed SSTable generations into one, dropping obsolete
-             * overwritten values and tombstones that provably shadow
-             * nothing older. Never touches the newest generation. Requires
-             * at least 3 flushed generations to do anything.
+             * flushed SSTable generations into one, dropping records
+             * already marked dead in either file's del-bitmap. Never
+             * touches the newest generation. Requires at least 3 flushed
+             * generations to do anything.
              * @return true if a merge happened, false if nothing was
              * eligible. Thread-safe; safe to call concurrently with
              * Put/Get/Delete and while background compaction is running

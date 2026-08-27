@@ -76,11 +76,18 @@ namespace {
     constexpr uint64_t kSSTableMagic = 0x53535442; // "SSTB" as a little-endian u32
     constexpr size_t kFooterSize = sizeof(uint64_t) + sizeof(uint64_t) + sizeof(uint32_t);
 
-    void write_put_record(std::ofstream& ofs, const std::string& key, const std::string& value) {
+    // Every on-disk data record is a live PUT at write time -- type is kept
+    // (rather than dropped) purely so the framing style matches the rest of
+    // this codebase's length-prefixed records and leaves room for a future
+    // record kind without another format change; it is always 1 today,
+    // since deletes no longer produce their own on-disk record (see the
+    // del-bitmap in sstable.h).
+    void write_put_record(std::ofstream& ofs, uint64_t serial, const std::string& key, const std::string& value) {
         char type = 1;
         uint32_t kLen = static_cast<uint32_t>(key.size());
         uint32_t vLen = static_cast<uint32_t>(value.size());
         ofs.write(&type, 1);
+        ofs.write(reinterpret_cast<const char*>(&serial), sizeof(serial));
         ofs.write(reinterpret_cast<const char*>(&kLen), sizeof(kLen));
         ofs.write(key.data(), kLen);
         ofs.write(reinterpret_cast<const char*>(&vLen), sizeof(vLen));
@@ -88,19 +95,7 @@ namespace {
     }
 
     uint64_t put_record_size(const std::string& key, const std::string& value) {
-        return 1 + sizeof(uint32_t) + key.size() + sizeof(uint32_t) + value.size();
-    }
-
-    void write_delete_record(std::ofstream& ofs, const std::string& key) {
-        char type = 2;
-        uint32_t kLen = static_cast<uint32_t>(key.size());
-        ofs.write(&type, 1);
-        ofs.write(reinterpret_cast<const char*>(&kLen), sizeof(kLen));
-        ofs.write(key.data(), kLen);
-    }
-
-    uint64_t delete_record_size(const std::string& key) {
-        return 1 + sizeof(uint32_t) + key.size();
+        return 1 + sizeof(uint64_t) + sizeof(uint32_t) + key.size() + sizeof(uint32_t) + value.size();
     }
 
     // Forward-only cursor over one SSTable's data block, decoding and
@@ -137,22 +132,18 @@ namespace {
             has_current_ = false;
             if (!valid_ || static_cast<uint64_t>(ifs_.tellg()) >= data_end_) return;
             char type_raw;
-            if (!ifs_.read(&type_raw, 1)) return;
-            uint8_t type = static_cast<uint8_t>(type_raw);
+            if (!ifs_.read(&type_raw, 1)) return; // always 1 (PUT) -- see write_put_record's comment
+            uint64_t serial = 0;
+            if (!ifs_.read(reinterpret_cast<char*>(&serial), sizeof(serial))) return;
             uint32_t kLen = 0;
             if (!ifs_.read(reinterpret_cast<char*>(&kLen), sizeof(kLen))) return;
             std::string key(kLen, '\0');
             if (kLen > 0 && !ifs_.read(&key[0], kLen)) return;
-            if (type == 2) { // DELETE / tombstone -- no value bytes follow
-                current_ = {std::move(key), "", true};
-                has_current_ = true;
-                return;
-            }
             uint32_t vLen = 0;
             if (!ifs_.read(reinterpret_cast<char*>(&vLen), sizeof(vLen))) return;
             std::string value(vLen, '\0');
             if (vLen > 0 && !ifs_.read(&value[0], vLen)) return;
-            current_ = {std::move(key), std::move(value), false};
+            current_ = {std::move(key), std::move(value), serial};
             has_current_ = true;
         }
 
@@ -167,50 +158,31 @@ namespace {
 
 bool SSTable::write_file(const std::string& filename,
                           const std::map<std::string, std::string>& data,
-                          const std::set<std::string>& tombstones,
                           std::vector<IndexEntry>& out_index) {
     std::ofstream ofs(filename, std::ios::binary);
     if (!ofs.is_open()) return false;
 
     out_index.clear();
-    out_index.reserve(data.size() + tombstones.size());
+    out_index.reserve(data.size());
 
-    // Merge the two already-sorted containers into one ascending-key
-    // sequence. A key can never appear in both: Put() clears any tombstone
-    // for the key it just wrote, and Delete() clears any memtable entry for
-    // the key it just marked deleted, so the two sets are always disjoint
-    // for a single flush generation.
-    auto it_data = data.begin();
-    auto it_tomb = tombstones.begin();
     uint64_t offset = 0;
-
-    while (it_data != data.end() || it_tomb != tombstones.end()) {
-        bool take_data;
-        if (it_tomb == tombstones.end()) take_data = true;
-        else if (it_data == data.end()) take_data = false;
-        else take_data = it_data->first < *it_tomb;
-
-        if (take_data) {
-            out_index.push_back({it_data->first, offset});
-            write_put_record(ofs, it_data->first, it_data->second);
-            offset += put_record_size(it_data->first, it_data->second);
-            ++it_data;
-        } else {
-            out_index.push_back({*it_tomb, offset});
-            write_delete_record(ofs, *it_tomb);
-            offset += delete_record_size(*it_tomb);
-            ++it_tomb;
-        }
+    uint64_t serial = 0;
+    for (const auto& [key, value] : data) {
+        out_index.push_back({key, offset, serial});
+        write_put_record(ofs, serial, key, value);
+        offset += put_record_size(key, value);
+        ++serial;
     }
 
-    // Index block: one (keyLen, key, offset) triple per data record, same
-    // ascending-key order as the data block above.
+    // Index block: one (keyLen, key, offset, serial) quad per data record,
+    // same ascending-key order as the data block above.
     uint64_t index_offset = offset;
     for (const auto& entry : out_index) {
         uint32_t kLen = static_cast<uint32_t>(entry.key.size());
         ofs.write(reinterpret_cast<const char*>(&kLen), sizeof(kLen));
         ofs.write(entry.key.data(), kLen);
         ofs.write(reinterpret_cast<const char*>(&entry.offset), sizeof(entry.offset));
+        ofs.write(reinterpret_cast<const char*>(&entry.serial), sizeof(entry.serial));
     }
 
     // Footer.
@@ -250,29 +222,43 @@ std::vector<IndexEntry> SSTable::load_index(const std::string& filename) {
         if (kLen > 0 && !ifs.read(&key[0], kLen)) break;
         uint64_t rec_offset = 0;
         if (!ifs.read(reinterpret_cast<char*>(&rec_offset), sizeof(rec_offset))) break;
-        index.push_back({std::move(key), rec_offset});
+        uint64_t serial = 0;
+        if (!ifs.read(reinterpret_cast<char*>(&serial), sizeof(serial))) break;
+        index.push_back({std::move(key), rec_offset, serial});
     }
     return index;
 }
 
-bool SSTable::merge_files(const std::string& older_path, const std::string& newer_path,
-                           const std::string& output_path, std::vector<IndexEntry>& out_index) {
+bool SSTable::merge_files(const std::string& older_path, const std::vector<uint8_t>& older_del,
+                           const std::string& newer_path, const std::vector<uint8_t>& newer_del,
+                           const std::string& output_path,
+                           std::vector<IndexEntry>& out_index, std::vector<uint8_t>& out_del) {
     RecordCursor older(older_path);
     RecordCursor newer(newer_path);
+
+    // Skip past any record already marked dead in its own file -- it was
+    // already proven superseded/deleted by the eager dead-marking
+    // invariant (StorageEngine's Put/Delete flip this bit the moment a
+    // record stops being live), so nothing behind it can still need it.
+    auto skip_dead = [](RecordCursor& cur, const std::vector<uint8_t>& del) {
+        while (cur.has_current() && is_dead(del, cur.current().serial)) cur.advance();
+    };
+    skip_dead(older, older_del);
+    skip_dead(newer, newer_del);
 
     std::ofstream ofs(output_path, std::ios::binary);
     if (!ofs.is_open()) return false;
 
     out_index.clear();
     uint64_t offset = 0;
+    uint64_t next_serial = 0;
 
-    // Same merge rule as a two-way sorted merge, applied to two STREAMS
-    // instead of two in-memory containers: on equal keys, `newer` wins;
-    // whichever is smaller advances alone otherwise. A winning tombstone is
-    // dropped entirely (never written) -- correct only when nothing older
-    // than `older_path` survives, which callers (StorageEngine's
-    // compactor) must guarantee by always merging the two globally-oldest
-    // generations.
+    // A standard two-way merge of two already-sorted, already-live-only
+    // streams. Keys should no longer collide between the two files in
+    // practice (eager marking means an overwritten key's old copy is
+    // already dead and was just skipped above), but the same-key branch is
+    // kept as a defensive tie-breaker (newer wins) rather than assuming
+    // that invariant always holds perfectly.
     while (older.has_current() || newer.has_current()) {
         bool same_key = older.has_current() && newer.has_current() &&
                          older.current().key == newer.current().key;
@@ -280,15 +266,17 @@ bool SSTable::merge_files(const std::string& older_path, const std::string& newe
             (newer.has_current() && (!older.has_current() || newer.current().key < older.current().key));
 
         const Record& winner = pick_newer ? newer.current() : older.current();
-        if (!winner.is_tombstone) {
-            out_index.push_back({winner.key, offset});
-            write_put_record(ofs, winner.key, winner.value);
-            offset += put_record_size(winner.key, winner.value);
-        }
+        out_index.push_back({winner.key, offset, next_serial});
+        write_put_record(ofs, next_serial, winner.key, winner.value);
+        offset += put_record_size(winner.key, winner.value);
+        ++next_serial;
 
         if (same_key) { older.advance(); newer.advance(); }
         else if (pick_newer) { newer.advance(); }
         else { older.advance(); }
+
+        skip_dead(older, older_del);
+        skip_dead(newer, newer_del);
     }
 
     uint64_t index_offset = offset;
@@ -297,6 +285,7 @@ bool SSTable::merge_files(const std::string& older_path, const std::string& newe
         ofs.write(reinterpret_cast<const char*>(&kLen), sizeof(kLen));
         ofs.write(entry.key.data(), kLen);
         ofs.write(reinterpret_cast<const char*>(&entry.offset), sizeof(entry.offset));
+        ofs.write(reinterpret_cast<const char*>(&entry.serial), sizeof(entry.serial));
     }
 
     uint64_t index_count = out_index.size();
@@ -306,6 +295,7 @@ bool SSTable::merge_files(const std::string& older_path, const std::string& newe
     ofs.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
 
     ofs.close();
+    out_del = make_del_bitmap(out_index.size());
     return true;
 }
 
@@ -315,81 +305,147 @@ SearchResult SSTable::search_with_index(const std::string& filename,
     auto it = std::lower_bound(index.begin(), index.end(), key,
         [](const IndexEntry& entry, const std::string& k) { return entry.key < k; });
     if (it == index.end() || it->key != key) {
-        return {false, "", false};
+        return {false, "", 0};
     }
 
     std::ifstream ifs(filename, std::ios::binary);
-    if (!ifs.is_open()) return {false, "", false};
+    if (!ifs.is_open()) return {false, "", 0};
     ifs.seekg(static_cast<std::streamoff>(it->offset));
 
     char type_raw;
-    if (!ifs.read(&type_raw, 1)) return {false, "", false};
-    uint8_t type = static_cast<uint8_t>(type_raw);
+    if (!ifs.read(&type_raw, 1)) return {false, "", 0};
+
+    uint64_t serial = 0;
+    if (!ifs.read(reinterpret_cast<char*>(&serial), sizeof(serial))) return {false, "", 0};
 
     uint32_t kLen = 0;
-    if (!ifs.read(reinterpret_cast<char*>(&kLen), sizeof(kLen))) return {false, "", false};
+    if (!ifs.read(reinterpret_cast<char*>(&kLen), sizeof(kLen))) return {false, "", 0};
     std::string found_key(kLen, '\0');
-    if (kLen > 0 && !ifs.read(&found_key[0], kLen)) return {false, "", false};
+    if (kLen > 0 && !ifs.read(&found_key[0], kLen)) return {false, "", 0};
     if (found_key != key) {
         // The index pointed somewhere that doesn't actually hold `key` --
         // treat as not-found rather than risk returning the wrong value.
-        return {false, "", false};
-    }
-
-    if (type == 2) { // DELETE / tombstone
-        return {true, "", true};
+        return {false, "", 0};
     }
 
     uint32_t vLen = 0;
-    if (!ifs.read(reinterpret_cast<char*>(&vLen), sizeof(vLen))) return {false, "", false};
+    if (!ifs.read(reinterpret_cast<char*>(&vLen), sizeof(vLen))) return {false, "", 0};
     std::string value(vLen, '\0');
-    if (vLen > 0 && !ifs.read(&value[0], vLen)) return {false, "", false};
-    return {true, value, false};
+    if (vLen > 0 && !ifs.read(&value[0], vLen)) return {false, "", 0};
+    return {true, value, serial};
 }
 
 SearchResult SSTable::search_with_index_mmap(const MappedFile& mapped,
                                               const std::vector<IndexEntry>& index,
                                               const std::string& key) {
-    if (!mapped.valid()) return {false, "", false};
+    if (!mapped.valid()) return {false, "", 0};
 
     auto it = std::lower_bound(index.begin(), index.end(), key,
         [](const IndexEntry& entry, const std::string& k) { return entry.key < k; });
     if (it == index.end() || it->key != key) {
-        return {false, "", false};
+        return {false, "", 0};
     }
 
     const char* base = mapped.data();
     const size_t sz = mapped.size();
     uint64_t off = it->offset;
 
-    if (off + 1 > sz) return {false, "", false};
-    uint8_t type = static_cast<uint8_t>(base[off]);
-    off += 1;
+    if (off + 1 > sz) return {false, "", 0};
+    off += 1; // type byte, always 1 (PUT)
 
-    if (off + sizeof(uint32_t) > sz) return {false, "", false};
+    if (off + sizeof(uint64_t) > sz) return {false, "", 0};
+    uint64_t serial;
+    std::memcpy(&serial, base + off, sizeof(serial));
+    off += sizeof(serial);
+
+    if (off + sizeof(uint32_t) > sz) return {false, "", 0};
     uint32_t kLen;
     std::memcpy(&kLen, base + off, sizeof(kLen));
     off += sizeof(kLen);
 
-    if (off + kLen > sz) return {false, "", false};
+    if (off + kLen > sz) return {false, "", 0};
     if (std::string(base + off, kLen) != key) {
         // The index pointed somewhere that doesn't actually hold `key` --
         // treat as not-found rather than risk returning the wrong value.
-        return {false, "", false};
+        return {false, "", 0};
     }
     off += kLen;
 
-    if (type == 2) { // DELETE / tombstone
-        return {true, "", true};
-    }
-
-    if (off + sizeof(uint32_t) > sz) return {false, "", false};
+    if (off + sizeof(uint32_t) > sz) return {false, "", 0};
     uint32_t vLen;
     std::memcpy(&vLen, base + off, sizeof(vLen));
     off += sizeof(vLen);
 
-    if (off + vLen > sz) return {false, "", false};
-    return {true, std::string(base + off, vLen), false};
+    if (off + vLen > sz) return {false, "", 0};
+    return {true, std::string(base + off, vLen), serial};
+}
+
+// --- Del-bitmap helpers ---
+
+std::vector<uint8_t> SSTable::make_del_bitmap(size_t num_bits) {
+    return std::vector<uint8_t>((num_bits + 7) / 8, 0);
+}
+
+std::vector<uint8_t> SSTable::load_del_bitmap(const std::string& path) {
+    std::ifstream ifs(path, std::ios::binary);
+    if (!ifs.is_open()) return {};
+    return std::vector<uint8_t>(std::istreambuf_iterator<char>(ifs), std::istreambuf_iterator<char>());
+}
+
+bool SSTable::save_del_bitmap(const std::string& path, const std::vector<uint8_t>& bits) {
+    std::ofstream ofs(path, std::ios::binary | std::ios::trunc);
+    if (!ofs.is_open()) return false;
+    if (!bits.empty()) ofs.write(reinterpret_cast<const char*>(bits.data()), static_cast<std::streamsize>(bits.size()));
+    return true;
+}
+
+bool SSTable::is_dead(const std::vector<uint8_t>& bits, uint64_t serial) {
+    size_t byte_idx = serial / 8;
+    if (byte_idx >= bits.size()) return false; // out of range -- treat as live rather than guess
+    uint8_t mask = static_cast<uint8_t>(1u << (serial % 8));
+    return (bits[byte_idx] & mask) != 0;
+}
+
+void SSTable::mark_dead_in_memory(std::vector<uint8_t>& bits, uint64_t serial) {
+    size_t byte_idx = serial / 8;
+    if (byte_idx >= bits.size()) bits.resize(byte_idx + 1, 0);
+    bits[byte_idx] |= static_cast<uint8_t>(1u << (serial % 8));
+}
+
+bool SSTable::flip_dead_on_disk(const std::string& path, uint64_t serial) {
+    size_t byte_idx = serial / 8;
+    std::fstream fs(path, std::ios::binary | std::ios::in | std::ios::out);
+    if (!fs.is_open()) return false;
+
+    fs.seekg(0, std::ios::end);
+    std::streamoff file_size = fs.tellg();
+    if (static_cast<std::streamoff>(byte_idx) >= file_size) {
+        // Bitmap file is shorter than expected (shouldn't normally happen,
+        // since it's always created sized to the flush threshold up front)
+        // -- extend it with zero bytes up to and including byte_idx rather
+        // than silently failing to record the mark.
+        fs.seekp(0, std::ios::end);
+        std::vector<char> pad(static_cast<size_t>(byte_idx + 1 - file_size), 0);
+        fs.write(pad.data(), static_cast<std::streamsize>(pad.size()));
+    }
+
+    fs.seekg(static_cast<std::streamoff>(byte_idx));
+    char byte = 0;
+    fs.read(&byte, 1);
+    uint8_t mask = static_cast<uint8_t>(1u << (serial % 8));
+    byte = static_cast<char>(static_cast<uint8_t>(byte) | mask);
+
+    fs.seekp(static_cast<std::streamoff>(byte_idx));
+    fs.write(&byte, 1);
+    fs.flush();
+    return true;
+}
+
+std::string SSTable::del_path_for(const std::string& sst_path) {
+    if (sst_path.size() >= 4 && sst_path.compare(sst_path.size() - 4, 4, ".sst") == 0) {
+        return sst_path.substr(0, sst_path.size() - 4) + ".del";
+    }
+    return sst_path + ".del";
 }
 
 } // namespace kv_engine
