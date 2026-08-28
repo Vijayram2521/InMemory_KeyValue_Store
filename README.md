@@ -20,10 +20,15 @@ inflated by everything fitting comfortably in RAM:
 | **Reads** | **~6.3k RPS** |
 | **Writes** | **~12.9k WPS** |
 | **Deletes** | **~45k DPS** |
+| **Mixed workload (interleaved reads/writes/deletes)** | **~7.0k ops/sec combined** — 50,000,000 ops in ~2.2 hours |
 
-3,000,000 writes → 300,000 deletes → 10,000,000 reads, values 512–4096B, 4 threads, background
-compaction on, cold page cache before the read phase. These are the only throughput numbers this
-README presents — see [Performance](#performance) for why, and how to reproduce them.
+The first three rows: 3,000,000 writes → 300,000 deletes → 10,000,000 reads, values 512–4096B, 4
+threads, background compaction on, cold page cache before the read phase. The mixed row: the same
+seed data, then 50,000,000 reads / 5,000,000 writes / 1,000,000 deletes genuinely interleaved across
+4 threads (not sequential phases) — a closer approximation of real traffic than any single-operation
+phase, and the number that most directly reflects per-shard locking's actual payoff (see
+[Performance](#performance)). These are the only throughput numbers this README presents — see
+[Performance](#performance) for why, and how to reproduce them.
 
 ## What's implemented
 
@@ -39,6 +44,14 @@ README presents — see [Performance](#performance) for why, and how to reproduc
   check before trusting any hit. Checkpointed to disk periodically so a restart doesn't have to
   rebuild it from scratch — the checkpoint is allowed to be stale; restart closes the gap by folding
   in whatever's newer and self-healing anything it finds already dead.
+- **Per-shard locking.** The 32 index shards each have their own lock, plus a separate lock for the
+  SSTable-level caches (index/del-bitmap/mmap/file list) independent of the memtable's own lock —
+  replacing one engine-wide lock that made every `Put`/`Delete` block every concurrent `Get`, even
+  for an unrelated key. Pays off specifically under real concurrent mixed access (measured: +45%
+  combined throughput on the mixed workload above vs. the global index alone); a workload where every
+  thread does the same single operation type at once doesn't have the same contention to relieve, and
+  measured flat-to-slightly-worse there instead — the honest trade of finer-grained locking's per-call
+  overhead against contention it doesn't get a chance to avoid.
 - **Background compaction** — merges the two oldest SSTable generations at a time, holding no lock
   during the actual merge (only the final metadata swap is briefly exclusive), gated by a size-ratio
   check that bounds the cost of any one pass.
@@ -165,8 +178,34 @@ docker run --memory=4g --memory-swap=4g -v "$(pwd)/data:/home/bench/vol" kv_benc
   --enable-compaction --data-dir=/home/bench/vol/data
 ```
 
+Reproduce (mixed workload):
+```bash
+docker run --memory=4g --memory-swap=4g -v "$(pwd)/data:/home/bench/vol" kv_benchmark \
+  --writes=3000000 --deletes=300000 \
+  --mixed-reads=50000000 --mixed-writes=5000000 --mixed-deletes=1000000 \
+  --min-value-size=512 --max-value-size=4096 --memtable-threshold=100000 --threads=4 \
+  --enable-compaction --data-dir=/home/bench/vol/data
+```
+
+**Per-shard locking's payoff shows up specifically on the mixed workload, not the single-operation
+phases.** Same 4GB-capped setup, global key index in both cases, only the locking model differs:
+
+| | Global index alone | + Per-shard locking |
+|---|---|---|
+| Mixed workload | 4,803 ops/sec (~3.24h) | **6,965 ops/sec (~2.23h)** |
+| Reads (standalone phase) | 6,307 RPS | 6,284 RPS |
+| Deletes (standalone phase) | 45,448 DPS | 38,008 DPS |
+
+The mixed phase interleaves Get/Put/Delete across 4 threads against different keys, which is exactly
+where independent per-shard locks have contention to relieve — different threads' operations often
+land on different shards and stop blocking each other, a 45% win. A standalone phase (every thread
+doing the *same* operation type at once, e.g. all deleting) doesn't have that same contention to
+begin with, so the extra lock acquisitions show up as pure overhead instead — flat on reads, worse on
+deletes. Both are correctness-confirmed: identical or matching-to-the-4th-decimal observed miss rates
+across every configuration.
+
 Note: the global key index's on-disk *checkpointing* (`StartIndexCheckpointing`) isn't currently
-wired into `kv_benchmark`'s CLI, so the numbers above measure the index's in-memory lookup
+wired into `kv_benchmark`'s CLI, so every number above measures the index's in-memory lookup
 acceleration — real and what's actually on the hot path — but not checkpoint-write overhead, since
 that thread was never started during these runs.
 
@@ -181,8 +220,8 @@ cmake -S . -B build && cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-This builds `kv_tests` (118 checks), `kv_cluster_tests` (43 checks), `kv_benchmark` (single-node
-throughput), and `cluster_benchmark` (distributed throughput).
+This builds `kv_tests` (121 checks, including a concurrent Put/Delete/Get stress test), `kv_cluster_tests`
+(43 checks), `kv_benchmark` (single-node throughput), and `cluster_benchmark` (distributed throughput).
 
 ```bash
 # Single-node benchmark
@@ -204,10 +243,13 @@ or served over the network via `compute_node`/`leader_node`.
 - [x] Background compaction (size-ratio-gated, lock-free merge)
 - [x] Leader + compute-node distributed cluster, consistent hashing
 - [x] Memory-constrained, cold-cache-controlled benchmarking methodology
+- [x] Per-shard locking (index shards + a separate SSTable-caches lock, replacing one engine-wide
+      lock) — +45% combined throughput on the mixed workload; measured neutral-to-worse on
+      single-operation-type phases, an expected trade-off (see [Performance](#performance))
 - [ ] Wire `StartIndexCheckpointing` into `kv_benchmark`'s CLI so checkpoint-write overhead is
       actually measured, not just the in-memory lookup path
-- [ ] Per-shard locking for the global key index (the sharded structure is already in place; the
-      rest of `StorageEngine` still serializes through one engine-wide lock)
+- [ ] Shard the memtable itself (still one unsharded structure every `Put`/`Delete` briefly
+      serializes on, even with everything else now split by shard)
 - [ ] Size-tiered compaction (today's oldest-two-only strategy can permanently stall a pair once the
       size-ratio gate is crossed; the del-bitmap redesign removed the *technical* constraint that
       required oldest-two merging, but the scheduling policy itself hasn't been relaxed yet)
