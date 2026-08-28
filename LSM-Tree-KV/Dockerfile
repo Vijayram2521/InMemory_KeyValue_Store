@@ -17,6 +17,7 @@ FROM debian:bookworm-slim AS build
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         cmake \
+        liblz4-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
@@ -30,6 +31,7 @@ FROM debian:bookworm-slim AS kv_benchmark
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libstdc++6 \
+        liblz4-1 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --shell /usr/sbin/nologin bench
 
@@ -54,6 +56,7 @@ FROM debian:bookworm-slim AS compute_node
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libstdc++6 \
+        liblz4-1 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --shell /usr/sbin/nologin cnode \
     # /data is where docker-compose mounts each compute node's named
@@ -79,6 +82,7 @@ FROM debian:bookworm-slim AS leader_node
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libstdc++6 \
+        liblz4-1 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --shell /usr/sbin/nologin lnode
 
