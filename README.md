@@ -56,7 +56,15 @@ phase, and the number that most directly reflects per-shard locking's actual pay
   during the actual merge (only the final metadata swap is briefly exclusive), gated by a size-ratio
   check that bounds the cost of any one pass.
 - **Manifest** — durably tracks which SSTable generations exist and in what order.
-- **118 engine-level tests**, all wired into CTest.
+- **Opt-in LZ4 per-value compression.** Self-describing per-record (never block-level, so a lookup
+  never decompresses more than the one record it asked for): a value that doesn't actually shrink
+  falls back to raw storage rather than ever expanding a record on disk. Measured 0% reduction on
+  this project's own uniform-random-byte benchmark values — expected, since LZ4 is a match-based
+  compressor with no entropy-coding stage, and uniform random bytes have no matchable repeated
+  sequences to find — versus **22.6% on realistic JSON payloads** (`--json-values`, see
+  [Performance](#performance)), where repeated syntax and field names give it real structure to
+  exploit.
+- **133 engine-level tests**, all wired into CTest.
 
 **Distributed cluster — core implemented and benchmarked:**
 - Leader node routes `Put`/`Get`/`Delete` to one of several compute nodes via consistent hashing.
@@ -209,6 +217,36 @@ wired into `kv_benchmark`'s CLI, so every number above measures the index's in-m
 acceleration — real and what's actually on the hot path — but not checkpoint-write overhead, since
 that thread was never started during these runs.
 
+**LZ4 compression only does something on data that has structure to exploit.** This project's
+default benchmark values are uniform random bytes — deliberately adversarial to any compressor (LZ4
+is match-based, not entropy-coding, and uniform random bytes have essentially no matchable repeated
+sequences), which is *why* it measured exactly **0% size reduction** there: two otherwise-identical
+datasets, one compressed and one not, came out byte-for-byte identical on disk. `--json-values`
+generates heterogeneous, randomly-structured JSON objects instead (3072-4096B each, no two alike) as
+a realistic counterpart, and there compression actually has something to work with:
+
+Reproduce (either benchmark above, with `--json-values --enable-value-compression` added):
+```bash
+docker run --memory=4g --memory-swap=4g -v "$(pwd)/data:/home/bench/vol" kv_benchmark \
+  --writes=3000000 --deletes=300000 --reads=10000000 \
+  --json-values --enable-value-compression --memtable-threshold=100000 --threads=4 \
+  --enable-compaction --data-dir=/home/bench/vol/data
+```
+
+| | Random bytes, no compression | JSON + compression | Δ |
+|---|---|---|---|
+| On-disk dataset size (200K-write sample, exact byte count) | 1,452,329,271 | 1,123,791,624 | **-22.6%** |
+| WPS | 12,863.5 | 12,132.6 | -5.7% |
+| RPS | 6,284.0 | 6,319.85 | +0.6% (flat) |
+| Mixed ops/sec | 6,965.08 | 6,875.46 | -1.3% (flat) |
+
+Despite JSON values averaging 56% more raw bytes each (3,586B vs. 2,303B) than the random-byte
+baseline, RPS and mixed throughput came out essentially unchanged — plausibly because the ~22.6%
+on-disk footprint reduction offsets the larger logical value size, though this wasn't isolated
+further. WPS dropped modestly, consistent with the added per-write compression-attempt cost. All
+four configurations are correctness-confirmed: identical or matching-to-within-noise observed miss
+rates throughout.
+
 ## Getting Started
 
 **Prerequisites:** CMake 3.15+, a C++17 compiler (GCC 9+), Docker + Compose v2. Targets Linux — the
@@ -220,7 +258,7 @@ cmake -S . -B build && cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-This builds `kv_tests` (121 checks, including a concurrent Put/Delete/Get stress test), `kv_cluster_tests`
+This builds `kv_tests` (133 checks, including a concurrent Put/Delete/Get stress test), `kv_cluster_tests`
 (43 checks), `kv_benchmark` (single-node throughput), and `cluster_benchmark` (distributed throughput).
 
 ```bash
@@ -246,6 +284,10 @@ or served over the network via `compute_node`/`leader_node`.
 - [x] Per-shard locking (index shards + a separate SSTable-caches lock, replacing one engine-wide
       lock) — +45% combined throughput on the mixed workload; measured neutral-to-worse on
       single-operation-type phases, an expected trade-off (see [Performance](#performance))
+- [x] Value compression (LZ4, per-value, opt-in) — 0% reduction on this project's own adversarial
+      random-byte benchmark values (expected, see [Performance](#performance)), 22.6% on realistic
+      JSON payloads (`--json-values`, added alongside it specifically to give compression a fair,
+      non-adversarial test)
 - [ ] Wire `StartIndexCheckpointing` into `kv_benchmark`'s CLI so checkpoint-write overhead is
       actually measured, not just the in-memory lookup path
 - [ ] Shard the memtable itself (still one unsharded structure every `Put`/`Delete` briefly
@@ -253,7 +295,6 @@ or served over the network via `compute_node`/`leader_node`.
 - [ ] Size-tiered compaction (today's oldest-two-only strategy can permanently stall a pair once the
       size-ratio gate is crossed; the del-bitmap redesign removed the *technical* constraint that
       required oldest-two merging, but the scheduling policy itself hasn't been relaxed yet)
-- [ ] Value compression (LZ4, per-value)
 - [ ] Snapshots
 - [ ] Cluster resize (dynamic add/remove of compute nodes)
 - [ ] Virtual nodes (real load balance across a small node count)
