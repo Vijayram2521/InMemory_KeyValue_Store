@@ -186,6 +186,15 @@ struct BenchConfig {
     // See StorageEngine's use_value_compression doc comment. Off by
     // default; for A/B comparison against the uncompressed baseline.
     bool value_compression = false;
+
+    // Generate randomized JSON objects (see make_json_value) instead of
+    // make_value's uniform random bytes. --min-value-size/--max-value-size
+    // don't apply in this mode -- JSON objects are sized into their own
+    // fixed [kJsonMinSize, kJsonMaxSize) range instead (see json_values.h
+    // comment). Off by default -- the uniform-random-byte generator stays
+    // the baseline this project's numbers have always been measured
+    // against; this is the "realistic data" counterpart for comparison.
+    bool json_values = false;
 };
 
 void print_usage() {
@@ -261,6 +270,13 @@ void print_usage() {
         "                          falling back to raw storage when compression doesn't\n"
         "                          actually shrink it (never expands a record on disk). For\n"
         "                          A/B comparison against the uncompressed baseline. Default: off.\n"
+        "  --json-values           generate randomized, heterogeneous JSON objects (3072-4096B\n"
+        "                          each) instead of uniform random bytes -- --min-value-size/\n"
+        "                          --max-value-size don't apply in this mode. Real JSON has\n"
+        "                          exploitable structure (repeated syntax/field names) that\n"
+        "                          uniform random bytes don't, so this is the realistic-data\n"
+        "                          counterpart to the default generator for compression A/B\n"
+        "                          testing. Default: off.\n"
         "  --help                  show this message\n\n"
         "Note: every SSTable lookup binary-searches that file's cached index and does a\n"
         "single seekg -- there's no linear scan, so read cost no longer grows with total\n"
@@ -326,6 +342,8 @@ BenchConfig parse_args(int argc, char** argv) {
             cfg.mmap_reads = true;
         } else if (arg == "--enable-value-compression") {
             cfg.value_compression = true;
+        } else if (arg == "--json-values") {
+            cfg.json_values = true;
         } else {
             std::cerr << "Unknown argument: " << arg << " (--help for usage)\n";
             std::exit(1);
@@ -357,6 +375,120 @@ std::string make_value(size_t min_size, size_t max_size, std::mt19937_64& rng) {
     std::string s(size_dist(rng), '0');
     for (auto& c : s) c = charset[char_dist(rng)];
     return s;
+}
+
+// --- JSON value generation (--json-values) ---
+// Produces heterogeneous, randomized JSON objects sized into
+// [kJsonMinSize, kJsonMaxSize) bytes -- unlike make_value()'s uniform random
+// bytes (adversarial to any compressor by construction: this project
+// measured exactly 0% LZ4 reduction on that mode, since LZ4 is a
+// match-based compressor with no entropy-coding stage, and uniform random
+// bytes have no matchable repeated sequences to find), real JSON has
+// substantial exploitable structure -- repeated syntax (`","`, `":"`),
+// repeated field names, a limited string vocabulary -- so this is the
+// "realistic data" counterpart for an honest A/B comparison against that
+// adversarial baseline. No two generated objects are byte-identical or
+// even structurally identical: array length, object field count, and all
+// content are randomized per call -- a single fixed template would let
+// compression look artificially good (100% of objects near-identical),
+// which would defeat the point of a realistic test just as much as
+// uniform random bytes defeat it in the other direction.
+constexpr size_t kJsonMinSize = 3072;
+constexpr size_t kJsonMaxSize = 4096;
+
+const char* const kJsonWords[] = {
+    "alpha","bravo","charlie","delta","echo","foxtrot","golf","hotel",
+    "india","juliet","kilo","lima","mike","november","oscar","papa",
+    "quebec","romeo","sierra","tango","uniform","victor","whiskey","xray",
+    "yankee","zulu","orbit","cluster","signal","vector","matrix","photon",
+    "quantum","nebula","comet","meteor","plasma","fusion","reactor","engine",
+    "harbor","canyon","summit","valley","meadow","forest","desert","glacier",
+    "river","ocean","island","plateau","horizon","zenith","compass","anchor",
+    "voyage","journey","mission","project","system","module","service","client",
+    "server","gateway","router","bridge","tunnel","channel","stream","packet",
+    "record","ledger","archive","registry","catalog","index","query","filter",
+    "widget","gadget","device","sensor","monitor","display","console","terminal",
+};
+constexpr size_t kNumJsonWords = sizeof(kJsonWords) / sizeof(kJsonWords[0]);
+
+std::string json_random_word(std::mt19937_64& rng) {
+    return kJsonWords[rng() % kNumJsonWords];
+}
+
+// Alphanumeric-only, so callers never need JSON string escaping on it.
+std::string json_random_hex(std::mt19937_64& rng, size_t len) {
+    static const char hexdigits[] = "0123456789abcdef";
+    std::string s(len, '0');
+    for (auto& c : s) c = hexdigits[rng() % 16];
+    return s;
+}
+
+// Builds one randomized JSON object: a handful of scalar fields, a
+// variable-length tags array, a variable-sized metadata object, then grows
+// a free-text description (built from json_random_word, so it's guaranteed
+// alphanumeric-plus-spaces and never needs escaping) one word at a time
+// until the total serialized size lands in [kJsonMinSize, kJsonMaxSize).
+std::string make_json_value(std::mt19937_64& rng) {
+    static const char* const kStatuses[] = {"active", "pending", "completed", "failed", "archived"};
+
+    std::ostringstream head;
+    head << "{\"id\":\"" << json_random_hex(rng, 24) << "\","
+         << "\"timestamp\":" << (1700000000000ULL + rng() % 200000000ULL) << ","
+         << "\"status\":\"" << kStatuses[rng() % 5] << "\",";
+
+    head << "\"tags\":[";
+    size_t num_tags = 3 + rng() % 8; // 3-10 entries
+    for (size_t i = 0; i < num_tags; ++i) {
+        if (i) head << ",";
+        head << "\"" << json_random_word(rng) << "\"";
+    }
+    head << "],";
+
+    head << "\"metadata\":{";
+    size_t num_meta = 2 + rng() % 5; // 2-6 entries
+    for (size_t i = 0; i < num_meta; ++i) {
+        if (i) head << ",";
+        head << "\"" << json_random_word(rng) << "_" << i << "\":";
+        if (rng() % 2 == 0) head << "\"" << json_random_word(rng) << "\"";
+        else head << (rng() % 100000);
+    }
+    head << "},";
+
+    head << "\"description\":\"";
+    std::string prefix = head.str();
+    const std::string suffix = "\"}";
+
+    // Pick a per-object target size at random within the whole range,
+    // rather than always padding to just past kJsonMinSize -- otherwise
+    // every object would cluster right at the low end (padding stops the
+    // instant it crosses the floor), defeating the point of a 3072-4096B
+    // *range*.
+    std::uniform_int_distribution<size_t> target_dist(kJsonMinSize, kJsonMaxSize - 1);
+    size_t target_size = target_dist(rng);
+
+    std::string description;
+    while (prefix.size() + description.size() + suffix.size() < target_size) {
+        if (!description.empty()) description += ' ';
+        description += json_random_word(rng);
+    }
+    size_t max_desc_len = kJsonMaxSize > prefix.size() + suffix.size()
+        ? kJsonMaxSize - prefix.size() - suffix.size() : 0;
+    if (description.size() > max_desc_len) {
+        description.resize(max_desc_len);
+        size_t last_space = description.find_last_of(' ');
+        if (last_space != std::string::npos) description.resize(last_space);
+    }
+
+    return prefix + description + suffix;
+}
+
+// Config-driven dispatch between the two value generators -- every call
+// site below goes through this instead of choosing directly, so adding a
+// third mode later only touches this one function. BenchConfig is already
+// fully defined above this point in the file.
+std::string generate_value(const BenchConfig& cfg, std::mt19937_64& rng) {
+    if (cfg.json_values) return make_json_value(rng);
+    return make_value(cfg.min_value_size, cfg.max_value_size, rng);
 }
 
 // "key_" and "miss_" are disjoint prefixes: hit_key(i) is always something the
@@ -466,7 +598,7 @@ WriteResult run_write_phase(StorageEngine& engine, const BenchConfig& cfg) {
                 size_t local_bytes = 0;
                 size_t local_done = 0;
                 for (size_t i = lo; i < hi; ++i) {
-                    std::string value = make_value(cfg.min_value_size, cfg.max_value_size, rng);
+                    std::string value = generate_value(cfg, rng);
                     local_bytes += value.size();
                     engine.Put(hit_key(i), value);
                     if (++local_done % 1000 == 0) done += 1000;
@@ -684,7 +816,7 @@ MixedResult run_mixed_phase(StorageEngine& engine, const BenchConfig& cfg) {
                         bool is_new = unit(rng) < 0.5;
                         size_t idx = is_new ? next_new_key.fetch_add(1, std::memory_order_relaxed)
                                              : hit_dist(rng);
-                        std::string value = make_value(cfg.min_value_size, cfg.max_value_size, rng);
+                        std::string value = generate_value(cfg, rng);
                         engine.Put(hit_key(idx), value);
                         if (is_new) ++local_new; else ++local_update;
                         ++local_put;
@@ -736,7 +868,8 @@ int main(int argc, char** argv) {
               << " data_dir=" << cfg.data_dir
               << " compaction=" << (cfg.enable_compaction ? "on" : "off")
               << " mmap_reads=" << (cfg.mmap_reads ? "on" : "off")
-              << " value_compression=" << (cfg.value_compression ? "on" : "off");
+              << " value_compression=" << (cfg.value_compression ? "on" : "off")
+              << " json_values=" << (cfg.json_values ? "on" : "off");
     bool mixed_mode = cfg.mixed_reads > 0 || cfg.mixed_writes > 0 || cfg.mixed_deletes > 0;
     if (mixed_mode) {
         std::cout << " mixed_reads=" << cfg.mixed_reads
