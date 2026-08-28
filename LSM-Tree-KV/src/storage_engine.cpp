@@ -100,6 +100,10 @@ struct StorageEngine::Impl {
     std::unordered_map<std::string, std::vector<uint8_t>> delcol_cache;
     const bool USE_MMAP;
     std::unordered_map<std::string, MappedFile> mmap_cache;
+    // Opt-in, write-side only -- see StorageEngine's use_value_compression
+    // doc comment. Read paths never consult this; every record
+    // self-describes whether it was compressed.
+    const bool USE_COMPRESSION;
 
     // Compaction: serializes compact_once() calls (background thread vs. a
     // manual/test call) so two passes never run concurrently -- separate
@@ -142,8 +146,8 @@ struct StorageEngine::Impl {
     // yet, since StorageEngine's constructor hasn't returned), so it reads
     // and mutates every field below directly with no locking at all --
     // correct in the same way none of this needed rw_lock before either.
-    Impl(const std::string& dir, size_t threshold, bool use_mmap)
-        : data_dir(dir), THRESHOLD(threshold), USE_MMAP(use_mmap) {
+    Impl(const std::string& dir, size_t threshold, bool use_mmap, bool use_compression)
+        : data_dir(dir), THRESHOLD(threshold), USE_MMAP(use_mmap), USE_COMPRESSION(use_compression) {
         std::filesystem::create_directories(data_dir);
 
         auto history = Manifest::load_history(data_dir);
@@ -418,7 +422,7 @@ struct StorageEngine::Impl {
         std::cout << "--- Persisting Generation " << seq << " to Disk ---" << std::endl;
 
         std::vector<IndexEntry> index;
-        if (SSTable::write_file(sst_path, memtable, index)) {
+        if (SSTable::write_file(sst_path, memtable, index, USE_COMPRESSION)) {
             // Del-bitmap sized to the flush threshold (the "flush key
             // limit"), not the actual record count -- most bits stay
             // unused if fewer than THRESHOLD keys were flushed (e.g. via
@@ -538,7 +542,7 @@ struct StorageEngine::Impl {
         std::vector<IndexEntry> merged_index;
         std::vector<uint8_t> merged_del;
         if (!SSTable::merge_files(path_a, del_a_snapshot, path_b, del_b_snapshot,
-                                   tmp_path, merged_index, merged_del)) {
+                                   tmp_path, merged_index, merged_del, USE_COMPRESSION)) {
             // Couldn't write the merged file -- abort without touching any
             // live state. Old generations are untouched; try again on the
             // next pass.
@@ -749,8 +753,9 @@ struct StorageEngine::Impl {
     }
 };
 
-StorageEngine::StorageEngine(const std::string& data_dir, size_t memtable_threshold, bool use_mmap_reads)
-    : pImpl(std::make_unique<Impl>(data_dir, memtable_threshold, use_mmap_reads)) {
+StorageEngine::StorageEngine(const std::string& data_dir, size_t memtable_threshold, bool use_mmap_reads,
+                              bool use_value_compression)
+    : pImpl(std::make_unique<Impl>(data_dir, memtable_threshold, use_mmap_reads, use_value_compression)) {
     std::cout << "Engine initialized at: " << data_dir
               << " | Active Sequence: " << pImpl->current_seq.load() << std::endl;
 }

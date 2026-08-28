@@ -22,9 +22,18 @@ namespace kv_engine {
              * from mapped memory instead of a fresh open()/seekg()/read()
              * per lookup. Default false leaves the original ifstream-based
              * read path unchanged, so this is purely opt-in for A/B testing.
+             * @param use_value_compression Opt-in: when true, every new
+             * SSTable record's value is attempted through LZ4 at
+             * flush/compaction time, falling back to raw storage if
+             * compression doesn't actually shrink it (never expands a
+             * record on disk). Purely a write-time decision -- the read
+             * path is always format-aware and decompresses correctly
+             * regardless of this flag, so files written with different
+             * settings (including across a restart with this flag
+             * changed) coexist and read back correctly either way.
              */
             StorageEngine(const std::string& data_dir = "./data", size_t memtable_threshold = 5,
-                          bool use_mmap_reads = false);
+                          bool use_mmap_reads = false, bool use_value_compression = false);
             ~StorageEngine() ;
 
             // Prevent copying to avoid multiple engines fighting over the same files

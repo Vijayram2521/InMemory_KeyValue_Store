@@ -70,7 +70,16 @@ namespace kv_engine {
     //   [data block]  one live-PUT record per key, in ascending-key order,
     //                 each tagged with its serial number (0-based position
     //                 in this sequence). Deletes no longer produce their
-    //                 own on-disk record -- see the del-bitmap below.
+    //                 own on-disk record -- see the del-bitmap below. Each
+    //                 record's value is optionally LZ4-compressed
+    //                 per-record (never block-level, so a lookup never
+    //                 needs to decompress more than the one record it
+    //                 asked for) -- see the `compress` parameter below.
+    //                 The record is self-describing (carries its own
+    //                 compressed/not flag), so files written with
+    //                 compression on and off can coexist and are always
+    //                 read correctly regardless of the reading engine
+    //                 instance's own setting.
     //   [index block] one (keyLen, key, offset, serial) quad per data
     //                 record, in the same ascending-key order.
     //   [footer]      fixed-size trailer: index block's offset, how many
@@ -91,10 +100,13 @@ namespace kv_engine {
         // followed by its index and footer. On success, `out_index` receives
         // the index built while writing -- callers that just created the
         // file (StorageEngine::flush) can cache it directly instead of
-        // re-reading the file to rebuild it.
+        // re-reading the file to rebuild it. `compress`: attempt LZ4 on
+        // each value, per-record; a value that doesn't actually shrink is
+        // stored raw instead (never expands a record on disk).
         static bool write_file(const std::string& filename,
                                 const std::map<std::string, std::string>& data,
-                                std::vector<IndexEntry>& out_index);
+                                std::vector<IndexEntry>& out_index,
+                                bool compress);
 
         // Reads just the footer and index block of an existing SSTable file
         // (not the data block) and returns its index. Used to rebuild the
@@ -118,11 +130,16 @@ namespace kv_engine {
         // sequential serial number. On success, out_index receives the
         // index built while writing (same convention as write_file) and
         // out_del receives a fresh all-live del-bitmap sized to the actual
-        // survivor count.
+        // survivor count. `compress`: same meaning as write_file's --
+        // applies to every record this merge writes, regardless of whether
+        // the source records were themselves compressed (each is
+        // decompressed by the read side transparently, then this decides
+        // fresh whether to compress the output copy).
         static bool merge_files(const std::string& older_path, const std::vector<uint8_t>& older_del,
                                  const std::string& newer_path, const std::vector<uint8_t>& newer_del,
                                  const std::string& output_path,
-                                 std::vector<IndexEntry>& out_index, std::vector<uint8_t>& out_del);
+                                 std::vector<IndexEntry>& out_index, std::vector<uint8_t>& out_del,
+                                 bool compress);
 
         // Binary searches the (already sorted) `index` for `key`. On a
         // match, seeks straight to its byte offset and reads that one

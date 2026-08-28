@@ -3,6 +3,7 @@
 #include <cstring>
 #include <fstream>
 #include <cstdint>
+#include <lz4.h>
 #if defined(__unix__) || defined(__APPLE__)
 #define KV_HAVE_MMAP 1
 #include <fcntl.h>
@@ -76,26 +77,74 @@ namespace {
     constexpr uint64_t kSSTableMagic = 0x53535442; // "SSTB" as a little-endian u32
     constexpr size_t kFooterSize = sizeof(uint64_t) + sizeof(uint64_t) + sizeof(uint32_t);
 
+    // Attempts LZ4 compression of `value` when `enabled`. Only reports a
+    // compressed result if it's strictly smaller than the original -- a
+    // record on disk never expands relative to storing the value raw, so
+    // pathologically incompressible values (e.g. this project's own
+    // uniformly-random benchmark values) just fall back to raw storage at
+    // no extra cost beyond the one failed compression attempt.
+    struct CompressedValue {
+        bool compressed = false;
+        std::string bytes; // what actually gets written to disk
+    };
+
+    CompressedValue compress_value(const std::string& value, bool enabled) {
+        if (!enabled || value.empty()) return {false, value};
+        int bound = LZ4_compressBound(static_cast<int>(value.size()));
+        if (bound <= 0) return {false, value};
+        std::string dst(static_cast<size_t>(bound), '\0');
+        int written = LZ4_compress_default(value.data(), &dst[0],
+                                            static_cast<int>(value.size()), bound);
+        if (written <= 0 || static_cast<size_t>(written) >= value.size()) {
+            return {false, value};
+        }
+        dst.resize(static_cast<size_t>(written));
+        return {true, std::move(dst)};
+    }
+
+    // Reverses compress_value. `compressed=false` just returns the stored
+    // bytes as-is (they already are the value). A decompression failure
+    // (shouldn't happen against this engine's own writes) returns an empty
+    // string rather than garbage -- fails safe, not silently wrong.
+    std::string decompress_value(const char* data, uint32_t stored_len, bool compressed, uint32_t original_len) {
+        if (!compressed) return std::string(data, stored_len);
+        std::string out(original_len, '\0');
+        if (original_len > 0) {
+            int written = LZ4_decompress_safe(data, &out[0],
+                                               static_cast<int>(stored_len), static_cast<int>(original_len));
+            if (written < 0 || static_cast<uint32_t>(written) != original_len) return std::string();
+        }
+        return out;
+    }
+
     // Every on-disk data record is a live PUT at write time -- type is kept
     // (rather than dropped) purely so the framing style matches the rest of
     // this codebase's length-prefixed records and leaves room for a future
     // record kind without another format change; it is always 1 today,
     // since deletes no longer produce their own on-disk record (see the
-    // del-bitmap in sstable.h).
-    void write_put_record(std::ofstream& ofs, uint64_t serial, const std::string& key, const std::string& value) {
+    // del-bitmap in sstable.h). Returns the number of bytes actually
+    // written, so callers track data-block offsets from the real,
+    // possibly-compressed size instead of a separately (and redundantly)
+    // computed one.
+    uint64_t write_put_record(std::ofstream& ofs, uint64_t serial, const std::string& key,
+                               const std::string& value, bool compress) {
         char type = 1;
         uint32_t kLen = static_cast<uint32_t>(key.size());
-        uint32_t vLen = static_cast<uint32_t>(value.size());
+        CompressedValue cv = compress_value(value, compress);
+        char compFlag = cv.compressed ? 1 : 0;
+        uint32_t storedLen = static_cast<uint32_t>(cv.bytes.size());
+        uint32_t originalLen = static_cast<uint32_t>(value.size());
+
         ofs.write(&type, 1);
         ofs.write(reinterpret_cast<const char*>(&serial), sizeof(serial));
         ofs.write(reinterpret_cast<const char*>(&kLen), sizeof(kLen));
         ofs.write(key.data(), kLen);
-        ofs.write(reinterpret_cast<const char*>(&vLen), sizeof(vLen));
-        ofs.write(value.data(), vLen);
-    }
+        ofs.write(&compFlag, 1);
+        ofs.write(reinterpret_cast<const char*>(&storedLen), sizeof(storedLen));
+        ofs.write(reinterpret_cast<const char*>(&originalLen), sizeof(originalLen));
+        ofs.write(cv.bytes.data(), storedLen);
 
-    uint64_t put_record_size(const std::string& key, const std::string& value) {
-        return 1 + sizeof(uint64_t) + sizeof(uint32_t) + key.size() + sizeof(uint32_t) + value.size();
+        return 1 + sizeof(serial) + sizeof(kLen) + kLen + 1 + sizeof(storedLen) + sizeof(originalLen) + storedLen;
     }
 
     // Forward-only cursor over one SSTable's data block, decoding and
@@ -139,10 +188,15 @@ namespace {
             if (!ifs_.read(reinterpret_cast<char*>(&kLen), sizeof(kLen))) return;
             std::string key(kLen, '\0');
             if (kLen > 0 && !ifs_.read(&key[0], kLen)) return;
-            uint32_t vLen = 0;
-            if (!ifs_.read(reinterpret_cast<char*>(&vLen), sizeof(vLen))) return;
-            std::string value(vLen, '\0');
-            if (vLen > 0 && !ifs_.read(&value[0], vLen)) return;
+            char compFlag = 0;
+            if (!ifs_.read(&compFlag, 1)) return;
+            uint32_t storedLen = 0;
+            if (!ifs_.read(reinterpret_cast<char*>(&storedLen), sizeof(storedLen))) return;
+            uint32_t originalLen = 0;
+            if (!ifs_.read(reinterpret_cast<char*>(&originalLen), sizeof(originalLen))) return;
+            std::string stored(storedLen, '\0');
+            if (storedLen > 0 && !ifs_.read(&stored[0], storedLen)) return;
+            std::string value = decompress_value(stored.data(), storedLen, compFlag != 0, originalLen);
             current_ = {std::move(key), std::move(value), serial};
             has_current_ = true;
         }
@@ -158,7 +212,8 @@ namespace {
 
 bool SSTable::write_file(const std::string& filename,
                           const std::map<std::string, std::string>& data,
-                          std::vector<IndexEntry>& out_index) {
+                          std::vector<IndexEntry>& out_index,
+                          bool compress) {
     std::ofstream ofs(filename, std::ios::binary);
     if (!ofs.is_open()) return false;
 
@@ -169,8 +224,7 @@ bool SSTable::write_file(const std::string& filename,
     uint64_t serial = 0;
     for (const auto& [key, value] : data) {
         out_index.push_back({key, offset, serial});
-        write_put_record(ofs, serial, key, value);
-        offset += put_record_size(key, value);
+        offset += write_put_record(ofs, serial, key, value, compress);
         ++serial;
     }
 
@@ -232,7 +286,8 @@ std::vector<IndexEntry> SSTable::load_index(const std::string& filename) {
 bool SSTable::merge_files(const std::string& older_path, const std::vector<uint8_t>& older_del,
                            const std::string& newer_path, const std::vector<uint8_t>& newer_del,
                            const std::string& output_path,
-                           std::vector<IndexEntry>& out_index, std::vector<uint8_t>& out_del) {
+                           std::vector<IndexEntry>& out_index, std::vector<uint8_t>& out_del,
+                           bool compress) {
     RecordCursor older(older_path);
     RecordCursor newer(newer_path);
 
@@ -267,8 +322,7 @@ bool SSTable::merge_files(const std::string& older_path, const std::vector<uint8
 
         const Record& winner = pick_newer ? newer.current() : older.current();
         out_index.push_back({winner.key, offset, next_serial});
-        write_put_record(ofs, next_serial, winner.key, winner.value);
-        offset += put_record_size(winner.key, winner.value);
+        offset += write_put_record(ofs, next_serial, winner.key, winner.value, compress);
         ++next_serial;
 
         if (same_key) { older.advance(); newer.advance(); }
@@ -328,11 +382,15 @@ SearchResult SSTable::search_with_index(const std::string& filename,
         return {false, "", 0};
     }
 
-    uint32_t vLen = 0;
-    if (!ifs.read(reinterpret_cast<char*>(&vLen), sizeof(vLen))) return {false, "", 0};
-    std::string value(vLen, '\0');
-    if (vLen > 0 && !ifs.read(&value[0], vLen)) return {false, "", 0};
-    return {true, value, serial};
+    char compFlag = 0;
+    if (!ifs.read(&compFlag, 1)) return {false, "", 0};
+    uint32_t storedLen = 0;
+    if (!ifs.read(reinterpret_cast<char*>(&storedLen), sizeof(storedLen))) return {false, "", 0};
+    uint32_t originalLen = 0;
+    if (!ifs.read(reinterpret_cast<char*>(&originalLen), sizeof(originalLen))) return {false, "", 0};
+    std::string stored(storedLen, '\0');
+    if (storedLen > 0 && !ifs.read(&stored[0], storedLen)) return {false, "", 0};
+    return {true, decompress_value(stored.data(), storedLen, compFlag != 0, originalLen), serial};
 }
 
 SearchResult SSTable::search_with_index_mmap(const MappedFile& mapped,
@@ -371,13 +429,22 @@ SearchResult SSTable::search_with_index_mmap(const MappedFile& mapped,
     }
     off += kLen;
 
-    if (off + sizeof(uint32_t) > sz) return {false, "", 0};
-    uint32_t vLen;
-    std::memcpy(&vLen, base + off, sizeof(vLen));
-    off += sizeof(vLen);
+    if (off + 1 > sz) return {false, "", 0};
+    char compFlag = base[off];
+    off += 1;
 
-    if (off + vLen > sz) return {false, "", 0};
-    return {true, std::string(base + off, vLen), serial};
+    if (off + sizeof(uint32_t) > sz) return {false, "", 0};
+    uint32_t storedLen;
+    std::memcpy(&storedLen, base + off, sizeof(storedLen));
+    off += sizeof(storedLen);
+
+    if (off + sizeof(uint32_t) > sz) return {false, "", 0};
+    uint32_t originalLen;
+    std::memcpy(&originalLen, base + off, sizeof(originalLen));
+    off += sizeof(originalLen);
+
+    if (off + storedLen > sz) return {false, "", 0};
+    return {true, decompress_value(base + off, storedLen, compFlag != 0, originalLen), serial};
 }
 
 // --- Del-bitmap helpers ---

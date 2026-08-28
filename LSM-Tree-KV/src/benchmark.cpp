@@ -182,6 +182,10 @@ struct BenchConfig {
     // open()/seekg()/read() per lookup. Off by default; for A/B comparison
     // against the existing read path only, not a claimed improvement.
     bool mmap_reads = false;
+
+    // See StorageEngine's use_value_compression doc comment. Off by
+    // default; for A/B comparison against the uncompressed baseline.
+    bool value_compression = false;
 };
 
 void print_usage() {
@@ -253,6 +257,10 @@ void print_usage() {
         "                          compaction time) and read via mapped memory instead of a\n"
         "                          fresh open()/seekg()/read() per lookup. For A/B comparison\n"
         "                          against the default read path. Default: off.\n"
+        "  --enable-value-compression  attempt LZ4 on each value at flush/compaction time,\n"
+        "                          falling back to raw storage when compression doesn't\n"
+        "                          actually shrink it (never expands a record on disk). For\n"
+        "                          A/B comparison against the uncompressed baseline. Default: off.\n"
         "  --help                  show this message\n\n"
         "Note: every SSTable lookup binary-searches that file's cached index and does a\n"
         "single seekg -- there's no linear scan, so read cost no longer grows with total\n"
@@ -316,6 +324,8 @@ BenchConfig parse_args(int argc, char** argv) {
             cfg.drop_caches_before_read = true;
         } else if (arg == "--mmap-reads") {
             cfg.mmap_reads = true;
+        } else if (arg == "--enable-value-compression") {
+            cfg.value_compression = true;
         } else {
             std::cerr << "Unknown argument: " << arg << " (--help for usage)\n";
             std::exit(1);
@@ -725,7 +735,8 @@ int main(int argc, char** argv) {
               << " threads=" << cfg.threads
               << " data_dir=" << cfg.data_dir
               << " compaction=" << (cfg.enable_compaction ? "on" : "off")
-              << " mmap_reads=" << (cfg.mmap_reads ? "on" : "off");
+              << " mmap_reads=" << (cfg.mmap_reads ? "on" : "off")
+              << " value_compression=" << (cfg.value_compression ? "on" : "off");
     bool mixed_mode = cfg.mixed_reads > 0 || cfg.mixed_writes > 0 || cfg.mixed_deletes > 0;
     if (mixed_mode) {
         std::cout << " mixed_reads=" << cfg.mixed_reads
@@ -742,7 +753,7 @@ int main(int argc, char** argv) {
         // Scoped so the engine (and its open WAL file handle) is destroyed
         // before we try to remove_all(data_dir) below -- Windows refuses to
         // delete a directory containing a file another handle still has open.
-        StorageEngine engine(cfg.data_dir, cfg.memtable_threshold, cfg.mmap_reads);
+        StorageEngine engine(cfg.data_dir, cfg.memtable_threshold, cfg.mmap_reads, cfg.value_compression);
         if (cfg.enable_compaction) {
             engine.StartBackgroundCompaction();
         }

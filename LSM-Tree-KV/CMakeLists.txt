@@ -13,10 +13,28 @@ endif()
 
 find_package(Threads REQUIRED)
 
+# LZ4 (opt-in per-value compression, see StorageEngine's use_value_compression):
+# a real, always-required dependency once linked in, not a soft-degrade like
+# KV_HAVE_MMAP -- a file written with compression on needs a build with LZ4
+# available to ever read it back, so there's no sensible partial-support
+# story. Confirmed present on both this project's build targets already:
+# Windows/MSYS2 UCRT64 ships lz4.h/liblz4.a; Ubuntu needs the one-time
+# `sudo apt-get install -y liblz4-dev` (the base liblz4 runtime package alone
+# doesn't include headers/link libs).
+find_path(LZ4_INCLUDE_DIR NAMES lz4.h)
+find_library(LZ4_LIBRARY NAMES lz4)
+if(NOT LZ4_INCLUDE_DIR OR NOT LZ4_LIBRARY)
+    message(FATAL_ERROR
+        "liblz4 (development package) not found. Install it and reconfigure:\n"
+        "  Ubuntu/Debian: sudo apt-get install -y liblz4-dev\n"
+        "  MSYS2:         pacman -S mingw-w64-ucrt-x86_64-lz4")
+endif()
+
 # Include directories so headers can be found
 # include/ contains engine headers, tests/ contains tests.h
 include_directories(include)
 include_directories(tests)
+include_directories(${LZ4_INCLUDE_DIR})
 
 # 1. Create the engine library from the implementations in src/
 add_library(
@@ -28,7 +46,7 @@ add_library(
     src/bloom_filter.cpp
     src/index_checkpoint.cpp
 )
-target_link_libraries(kv_engine Threads::Threads)
+target_link_libraries(kv_engine Threads::Threads ${LZ4_LIBRARY})
 
 # 2. Define Test Sources
 # Note: main.cpp is now correctly mapped to src/main.cpp
@@ -50,7 +68,7 @@ set(TEST_SOURCES
 add_executable(kv_tests ${TEST_SOURCES})
 
 # 4. Link the executable to the library
-target_link_libraries(kv_tests kv_engine)
+target_link_libraries(kv_tests kv_engine ${LZ4_LIBRARY})
 
 # 5. Support for Filesystem in older GCC/MinGW versions.
 # GCC >= 9 folds std::filesystem into libstdc++ itself; only pre-9 toolchains
@@ -67,7 +85,7 @@ add_test(NAME kv_tests COMMAND kv_tests WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
 # 7. Throughput benchmark (writes/sec, reads/sec) -- see src/benchmark.cpp.
 add_executable(kv_benchmark src/benchmark.cpp)
-target_link_libraries(kv_benchmark kv_engine Threads::Threads)
+target_link_libraries(kv_benchmark kv_engine Threads::Threads ${LZ4_LIBRARY})
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9.0)
     target_link_libraries(kv_benchmark stdc++fs)
 endif()
@@ -83,18 +101,18 @@ add_library(
     src/cluster/compute_node_server.cpp
     src/cluster/leader_server.cpp
 )
-target_link_libraries(kv_cluster kv_engine Threads::Threads)
+target_link_libraries(kv_cluster kv_engine Threads::Threads ${LZ4_LIBRARY})
 
 add_executable(compute_node src/compute_node_main.cpp)
-target_link_libraries(compute_node kv_cluster kv_engine Threads::Threads)
+target_link_libraries(compute_node kv_cluster kv_engine Threads::Threads ${LZ4_LIBRARY})
 
 add_executable(leader_node src/leader_main.cpp)
-target_link_libraries(leader_node kv_cluster kv_engine Threads::Threads)
+target_link_libraries(leader_node kv_cluster kv_engine Threads::Threads ${LZ4_LIBRARY})
 
 add_executable(cluster_benchmark src/cluster_benchmark_main.cpp)
-target_link_libraries(cluster_benchmark kv_cluster kv_engine Threads::Threads)
+target_link_libraries(cluster_benchmark kv_cluster kv_engine Threads::Threads ${LZ4_LIBRARY})
 
 add_executable(kv_cluster_tests src/cluster_test_main.cpp tests/test_hash_ring.cpp
                                  tests/test_wire_protocol.cpp tests/test_cluster_integration.cpp)
-target_link_libraries(kv_cluster_tests kv_cluster kv_engine)
+target_link_libraries(kv_cluster_tests kv_cluster kv_engine ${LZ4_LIBRARY})
 add_test(NAME kv_cluster_tests COMMAND kv_cluster_tests WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
