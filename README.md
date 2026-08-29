@@ -17,10 +17,10 @@ inflated by everything fitting comfortably in RAM:
 
 | | |
 |---|---|
-| **Reads** | **~6.3k RPS** |
-| **Writes** | **~12.9k WPS** |
-| **Deletes** | **~45k DPS** |
-| **Mixed workload (interleaved reads/writes/deletes)** | **~7.0k ops/sec combined** — 50,000,000 ops in ~2.2 hours |
+| **Reads** | **~6.4k RPS** |
+| **Writes** | **~16.5k WPS** |
+| **Deletes** | **~37k DPS** |
+| **Mixed workload (interleaved reads/writes/deletes)** | **~6.7k ops/sec combined** — 50,000,000 ops in ~2.3 hours |
 
 The first three rows: 3,000,000 writes → 300,000 deletes → 10,000,000 reads, values 512–4096B, 4
 threads, background compaction on, cold page cache before the read phase. The mixed row: the same
@@ -52,6 +52,14 @@ phase, and the number that most directly reflects per-shard locking's actual pay
   thread does the same single operation type at once doesn't have the same contention to relieve, and
   measured flat-to-slightly-worse there instead — the honest trade of finer-grained locking's per-call
   overhead against contention it doesn't get a chance to avoid.
+- **Sharded memtable.** 8 independent shards, each its own lock, plus a small dedicated lock for the
+  WAL pointer (decoupled from memtable sharding — there's exactly one active WAL segment regardless
+  of shard count). Big win where it directly parallelizes concurrent writes: **+28% WPS** on a
+  write-only phase, since different-key `Put`s now genuinely run concurrently instead of serializing
+  on one lock. On the mixed workload specifically, a small measured *regression* instead (**-3.5%**
+  combined ops/sec) — `Put` now sums sizes across all 8 shards to check the flush threshold, and that
+  added per-write overhead outweighs the parallelism win once `Get`s are also competing for the same
+  shard locks. A known, understood trade-off, not fixed blind — see [Performance](#performance).
 - **Background compaction** — merges the two oldest SSTable generations at a time, holding no lock
   during the actual merge (only the final metadata swap is briefly exclusive), gated by a size-ratio
   check that bounds the cost of any one pass.
@@ -247,6 +255,30 @@ further. WPS dropped modestly, consistent with the added per-write compression-a
 four configurations are correctness-confirmed: identical or matching-to-within-noise observed miss
 rates throughout.
 
+**Memtable sharding is the opposite pattern from index sharding: it wins big on a pure-write phase
+and loses a little on the mixed workload.** Same 4GB-capped setup, random-byte values, only the
+memtable's locking model differs from the "+ Per-shard locking" (index-only) row above:
+
+| | Index sharding only | + Memtable sharding | Δ |
+|---|---|---|---|
+| WPS (standalone) | 12,863.5 | **16,482.3** | **+28.1%** |
+| Mixed ops/sec | 6,965.08 | 6,721.92 | -3.5% |
+| RPS (standalone) | 6,284.0 | 6,396.98 | +1.8% (flat) |
+
+A write-only phase is exactly what memtable sharding targets: different-key `Put`s hashing to
+different shards now genuinely run concurrently instead of serializing on one lock, and there's no
+competing read traffic to fight for those same shard locks — a clean 28% win. The mixed workload adds
+that competing traffic back, and layers on a real cost index sharding didn't have: after every `Put`,
+checking whether the memtable has crossed the flush threshold now means summing sizes across all 8
+shards (one shard-lock acquisition each) instead of reading one already-locked `.size()`. That
+overhead is small per call but happens on every write, and apparently outweighs the parallelism gain
+once `Get`s are in the mix too. A cheaper flush-trigger (an atomic running total updated on
+insert/erase, instead of re-summing) would likely recover this, deliberately not built in this pass —
+it's exactly the shape of derived counter that caused a real bug in the per-shard-locking phase (see
+that phase's notes), and this trade-off is small and well-understood enough not to be worth that risk
+casually. All configurations correctness-confirmed: identical or matching-to-within-noise observed
+miss rates.
+
 ## Getting Started
 
 **Prerequisites:** CMake 3.15+, a C++17 compiler (GCC 9+), Docker + Compose v2. Targets Linux — the
@@ -288,10 +320,17 @@ or served over the network via `compute_node`/`leader_node`.
       random-byte benchmark values (expected, see [Performance](#performance)), 22.6% on realistic
       JSON payloads (`--json-values`, added alongside it specifically to give compression a fair,
       non-adversarial test)
+- [x] Shard the memtable (8 shards + a dedicated WAL-pointer lock, replacing the single
+      memtable-wide lock) — +28.1% WPS on a write-only phase; -3.5% on the mixed workload specifically
+      (the per-write cross-shard threshold check's overhead outweighs the parallelism win once reads
+      are competing for the same locks too) — a known, understood trade-off, see
+      [Performance](#performance)
 - [ ] Wire `StartIndexCheckpointing` into `kv_benchmark`'s CLI so checkpoint-write overhead is
       actually measured, not just the in-memory lookup path
-- [ ] Shard the memtable itself (still one unsharded structure every `Put`/`Delete` briefly
-      serializes on, even with everything else now split by shard)
+- [ ] Cheaper memtable flush-trigger (an atomic running total instead of summing all 8 shards per
+      `Put`) to recover the mixed-workload regression above — deliberately not built alongside the
+      sharding itself to avoid reintroducing a derived-counter class of bug already hit once this
+      session
 - [ ] Size-tiered compaction (today's oldest-two-only strategy can permanently stall a pair once the
       size-ratio gate is crossed; the del-bitmap redesign removed the *technical* constraint that
       required oldest-two merging, but the scheduling policy itself hasn't been relaxed yet)
