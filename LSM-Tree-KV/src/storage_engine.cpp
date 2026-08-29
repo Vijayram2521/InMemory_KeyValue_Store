@@ -52,38 +52,73 @@ uint64_t parse_seq_from_path(const std::string& path) {
 // follow-up, not implemented here -- this bounds the worst case instead.
 constexpr double kMaxOlderToNewerSizeRatio = 4.0;
 
+// The memtable is sharded independently of the global key index (which
+// already shards by hash(key) % kNumShards) -- different structure,
+// different access pattern, different right-sized shard count. The index
+// covers the full on-disk keyspace (millions of keys); the memtable is
+// bounded by memtable_threshold (tens of thousands to a few hundred
+// thousand entries at any moment), so far fewer shards are needed before
+// returns diminish. A single named constant, same one-line-change
+// precedent as kNumShards, in case a different count matters later.
+// Deliberately a DIFFERENT name from shard_for/kNumShards (index) so the
+// two sharding schemes can never be silently conflated in code.
+constexpr size_t kNumMemtableShards = 8;
+
 struct StorageEngine::Impl {
     // --- Lock domains ---
-    // Three independent locks replace what used to be one engine-wide
-    // rw_lock, so operations that don't actually touch the same data stop
-    // blocking each other. Governing rules, load-bearing for deadlock
-    // freedom:
-    //   1. `files_lock` and any `shard_locks[i]` are NEVER held
-    //      simultaneously by the same thread, in either order -- every
-    //      function below acquires one, fully releases it, then (if
-    //      needed) acquires the other, rather than nesting them. This
-    //      alone makes deadlock between these two impossible.
-    //   2. `memtable_lock`, when held at all together with the others, is
-    //      always the OUTERMOST lock (Put/Delete hold it for their whole
-    //      call, and apply_put/apply_delete/flush -- invoked from inside
-    //      that hold -- acquire files_lock/shard_locks internally).
-    //      Nothing ever acquires files_lock or shard_locks first and then
-    //      tries to acquire memtable_lock while still holding them.
+    // Governing rules, load-bearing for deadlock freedom:
+    //   1. `files_lock` and any `shard_locks[i]` (index shards) are NEVER
+    //      held simultaneously by the same thread, in either order --
+    //      every function below acquires one, fully releases it, then (if
+    //      needed) acquires the other, rather than nesting them.
+    //   2. A `memtable_shard_locks[i]`, when held by Put/Delete, is always
+    //      the OUTERMOST lock relative to files_lock/index shard_locks
+    //      (apply_put/apply_delete -- invoked while still holding it --
+    //      reach files_lock/index shard_locks internally via
+    //      find_live_location/mark_dead). Nothing ever acquires
+    //      files_lock/index shard_locks first and then tries to acquire a
+    //      memtable shard lock while still holding them.
+    //   3. Put/Delete NEVER hold their own memtable shard lock while
+    //      calling flush() -- they fully release it first, check the
+    //      total size across shards (one shard's lock at a time, shared,
+    //      never two held simultaneously -- summing while holding a
+    //      different shard exclusively would be a lock-ordering deadlock
+    //      risk against another thread doing the same in the opposite
+    //      shard order), and only then, holding nothing, call flush().
+    //      flush() itself acquires every memtable shard lock together, in
+    //      the fixed order 0..N-1 -- the only place that ever happens, so
+    //      no other code path's ordering can conflict with it.
+    //   4. `wal_lock` (guards only the `wal` pointer itself, not WAL's
+    //      internals, which already have their own mutex for the actual
+    //      write) is always acquired AFTER any memtable shard lock a
+    //      thread holds, never before -- Put/Delete take it after their
+    //      own shard's mutation; flush() takes it last, after every
+    //      memtable shard lock, when rotating to a new WAL segment.
     //
-    // memtable_lock guards `memtable` and the `wal` pointer itself (not
-    // WAL's internals, which already have their own mutex for the actual
-    // disk write). flush() deliberately still runs its entire body
-    // (including the disk write) under this lock rather than releasing it
-    // partway through -- see flush()'s own comment for why that's not just
-    // an optimization left on the table.
-    std::shared_mutex memtable_lock;
-    std::map<std::string, std::string> memtable;
+    // flush() keeps holding every memtable shard lock for its entire body,
+    // including the disk write, rather than releasing them partway through
+    // -- see flush()'s own comment for why that's not just an optimization
+    // left on the table.
+    std::array<std::shared_mutex, kNumMemtableShards> memtable_shard_locks;
+    std::array<std::unordered_map<std::string, std::string>, kNumMemtableShards> memtable_shards;
+    std::shared_mutex wal_lock;
     std::unique_ptr<WAL> wal;
+    // Serializes flush() calls so concurrent Puts that all independently
+    // observed "over threshold" don't all try to flush at once -- only the
+    // first actually proceeds; the rest, once they get this, find every
+    // shard already empty and return immediately. Mirrors
+    // compaction_serialize_mutex_'s role for compact_once().
+    std::mutex flush_serialize_mutex_;
+
+    static size_t memtable_shard_for(const std::string& key) {
+        return std::hash<std::string>{}(key) % kNumMemtableShards;
+    }
 
     // Sequence numbers are claimed via fetch_add wherever a flush or
     // compaction pass needs one -- atomicity alone guarantees no two
     // passes ever claim the same number, with no need to coordinate with
-    // memtable_lock or files_lock just to keep a counter consistent.
+    // any memtable shard lock or files_lock just to keep a counter
+    // consistent.
     std::atomic<uint64_t> current_seq{0};
 
     std::string data_dir;
@@ -378,29 +413,33 @@ struct StorageEngine::Impl {
     // Core Put/Delete logic, shared between live calls and WAL replay
     // during recovery -- callers are responsible for the WAL append (live
     // calls do it before calling these; replay already has a durable WAL
-    // entry it's redoing). Requires memtable_lock held exclusively (held
-    // by Put/Delete, or implicitly single-threaded during construction).
+    // entry it's redoing). Requires the target key's memtable shard lock
+    // held exclusively (held by Put/Delete for their own shard, or
+    // implicitly single-threaded during construction) -- indexes directly
+    // into memtable_shards[memtable_shard_for(key)] without locking here
+    // itself, matching that assumption.
     void apply_put(const std::string& key, const std::string& value) {
         auto loc = find_live_location(key);
         if (loc) mark_dead(key, *loc);
-        memtable[key] = value;
+        memtable_shards[memtable_shard_for(key)][key] = value;
     }
 
     void apply_delete(const std::string& key) {
-        memtable.erase(key);
+        memtable_shards[memtable_shard_for(key)].erase(key);
         auto loc = find_live_location(key);
         if (loc) mark_dead(key, *loc);
     }
 
-    // Requires memtable_lock held exclusively by the caller (Put/
-    // ForceFlush) -- deliberately runs its ENTIRE body, including the
-    // SSTable disk write, under that hold rather than releasing it
-    // partway through the way compact_once() releases its lock during its
-    // slow merge phase. That's not an oversight: compact_once() merges
+    // Fully self-locking (no single caller could reasonably pre-acquire
+    // every memtable shard lock the way one memtable_lock used to suffice)
+    // -- deliberately keeps holding all of them for its ENTIRE body,
+    // including the SSTable disk write, rather than releasing partway
+    // through the way compact_once() releases its lock during its slow
+    // merge phase. That's not an oversight: compact_once() merges
     // already-durable, already-visible files, so releasing its lock
     // exposes nothing new to a concurrent reader. flush() is draining the
-    // ONLY copy of not-yet-durable data out of memory -- clearing the
-    // memtable before the write completes would create a window where a
+    // ONLY copy of not-yet-durable data out of memory -- clearing a shard
+    // before the write completes would create a window where a
     // just-flushed key is invisible to Get() (gone from the memtable, not
     // yet indexed on disk). The standard fix for that (keeping a
     // read-only "immutable memtable" snapshot visible during the write)
@@ -409,20 +448,43 @@ struct StorageEngine::Impl {
     // by the write itself, so the delete would go nowhere and the flush
     // would durably persist the stale value -- solving that needs a
     // tombstone-shaped mechanism again, undoing exactly what the
-    // del-bitmap redesign removed. Keeping flush() fully synchronous under
-    // memtable_lock avoids that hazard entirely, at the cost of Put/Delete
-    // still blocking on any flush they trigger -- same as before this
-    // change, just no longer blocking Gets/Puts/Deletes for OTHER keys
-    // that don't need the same shard/file locks flush() briefly takes.
+    // del-bitmap redesign removed. Sharding the memtable doesn't change
+    // that reasoning, so this stays fully synchronous, at the cost of
+    // Put/Delete still blocking on any flush they trigger -- same as
+    // before, just no longer blocking Gets/Puts/Deletes for OTHER keys
+    // that don't need the same memtable/index-shard/file locks flush()
+    // briefly takes.
     void flush() {
-        if (memtable.empty()) return;
+        std::lock_guard<std::mutex> serialize(flush_serialize_mutex_);
+
+        // Acquire every memtable shard lock together, in this fixed order
+        // -- the only place that ever happens, so no other code path's
+        // ordering (which only ever touches one shard at a time) can
+        // conflict with it. Held via RAII for the whole function.
+        std::vector<std::unique_lock<std::shared_mutex>> held;
+        held.reserve(kNumMemtableShards);
+        for (size_t i = 0; i < kNumMemtableShards; ++i) {
+            held.emplace_back(memtable_shard_locks[i]);
+        }
+
+        size_t total = 0;
+        for (const auto& shard : memtable_shards) total += shard.size();
+        if (total == 0) return; // another flush already handled it (see flush_serialize_mutex_)
+
+        // Combine all shards into one sorted map -- the only place a sort
+        // is actually needed (write_file requires it), so the shards
+        // themselves stay unordered_map for cheaper everyday Put/Delete.
+        std::map<std::string, std::string> combined;
+        for (const auto& shard : memtable_shards) {
+            combined.insert(shard.begin(), shard.end());
+        }
 
         uint64_t seq = current_seq.fetch_add(1);
         std::string sst_path = get_sst_path(seq);
         std::cout << "--- Persisting Generation " << seq << " to Disk ---" << std::endl;
 
         std::vector<IndexEntry> index;
-        if (SSTable::write_file(sst_path, memtable, index, USE_COMPRESSION)) {
+        if (SSTable::write_file(sst_path, combined, index, USE_COMPRESSION)) {
             // Del-bitmap sized to the flush threshold (the "flush key
             // limit"), not the actual record count -- most bits stay
             // unused if fewer than THRESHOLD keys were flushed (e.g. via
@@ -431,39 +493,12 @@ struct StorageEngine::Impl {
             SSTable::save_del_bitmap(SSTable::del_path_for(sst_path), del_bits);
 
             // Register the new file in files_lock's domain FIRST, before
-            // global_key_index can point at it below -- caught by the
-            // concurrency stress test: with the order reversed, a
-            // concurrent find_live_location() that discovered this file
-            // via global_key_index (already updated) but found files_lock
-            // didn't recognize it yet (not yet registered) would correctly
-            // refuse to trust it as live, per find_live_location's own
-            // safety check -- but that also meant it couldn't successfully
-            // mark it dead on a legitimate overwrite, silently dropping the
-            // dead-mark. The stale record then stayed invisible during the
-            // live session (masked by the memtable holding the real,
-            // newer value) but resurfaced as live data the moment a
-            // restart rebuilt the index purely from on-disk state, which
-            // has no memtable to mask it. Registering the file before
-            // publishing it via the index closes that window entirely.
-            //
-            // Manifest::add_entry (an append) is deliberately made HERE,
-            // under files_lock, rather than after releasing it -- also
-            // caught by the concurrency stress test, restart-only
-            // failures traced to this: compact_once()'s Manifest::rewrite
-            // (a full-file replace via temp+rename) already runs under
-            // its own files_lock hold. Under the single engine-wide lock
-            // this file replaced, that lock alone made add_entry and
-            // rewrite mutually exclusive for free; splitting the lock
-            // without moving add_entry inside files_lock let an append
-            // land on the manifest file mid-replacement -- landing on the
-            // file rewrite() had just renamed away from (silently lost,
-            // written to an orphaned inode) or racing its own read of
-            // sstable_files (producing a duplicate entry for this exact
-            // file). Both are on-disk corruption that a live session's
-            // Get() calls don't observe (they use the in-memory
-            // sstable_files/index_cache, unaffected), which is why this
-            // only ever showed up after a restart forced a from-scratch
-            // rebuild off the actual manifest file.
+            // global_key_index can point at it below, and Manifest::add_entry
+            // (an append) INSIDE files_lock, not after releasing it -- both
+            // load-bearing fixes for real bugs the concurrency stress test
+            // found during the per-shard-locking phase (see that phase's
+            // notes in this plan's history for the full explanation);
+            // unchanged here, just reached via a different outer lock.
             {
                 std::unique_lock flock(files_lock);
                 if (USE_MMAP) mmap_cache.emplace(sst_path, MappedFile(sst_path));
@@ -487,14 +522,16 @@ struct StorageEngine::Impl {
                     Location{this_file_seq, static_cast<uint32_t>(entry.serial)};
             }
 
-            uint64_t next_seq = seq + 1;
-            std::string next_wal_path = get_wal_path(next_seq);
-            wal = std::make_unique<WAL>(next_wal_path);
+            for (auto& shard : memtable_shards) shard.clear();
 
-            memtable.clear();
+            {
+                std::unique_lock wlock(wal_lock);
+                wal = std::make_unique<WAL>(get_wal_path(seq + 1));
+            }
 
             std::cout << "--- Flush Complete. Generation is now: " << current_seq.load() << " ---" << std::endl;
         }
+        // `held` releases every memtable shard lock here, RAII.
     }
 
     // Merges the two globally-oldest surviving SSTable generations into
@@ -506,8 +543,8 @@ struct StorageEngine::Impl {
     // one is safe to interleave with anything. Only the brief metadata
     // swap at the end takes files_lock exclusively, plus per-key shard
     // locks (sequentially, never nested with files_lock -- see the
-    // struct-level lock-ordering comment). Never touches memtable_lock at
-    // all -- compaction doesn't read or write the memtable.
+    // struct-level lock-ordering comment). Never touches any memtable
+    // shard lock at all -- compaction doesn't read or write the memtable.
     bool compact_once() {
         std::lock_guard<std::mutex> serialize(compaction_serialize_mutex_);
 
@@ -763,15 +800,32 @@ StorageEngine::StorageEngine(const std::string& data_dir, size_t memtable_thresh
 StorageEngine::~StorageEngine() = default;
 
 bool StorageEngine::Put(const std::string& key, const std::string& value) {
-    std::unique_lock lock(pImpl->memtable_lock);
-
-    if (!pImpl->wal->append(LogOp::PUT, pImpl->current_seq.load(), key, value)) {
-        return false;
+    size_t shard = Impl::memtable_shard_for(key);
+    {
+        // This shard's lock is released before the threshold check below
+        // (never held while calling flush(), which needs to acquire every
+        // memtable shard lock including this one -- see the struct-level
+        // lock-ordering comment for why that's a hard requirement, not
+        // just tidiness).
+        std::unique_lock slock(pImpl->memtable_shard_locks[shard]);
+        bool appended;
+        {
+            std::shared_lock wlock(pImpl->wal_lock);
+            appended = pImpl->wal->append(LogOp::PUT, pImpl->current_seq.load(), key, value);
+        }
+        if (!appended) return false;
+        pImpl->apply_put(key, value);
     }
 
-    pImpl->apply_put(key, value);
-
-    if (pImpl->memtable.size() >= pImpl->THRESHOLD) {
+    // Total size across all shards, one shard's lock at a time, shared,
+    // never two held simultaneously -- avoids a lock-ordering deadlock
+    // against another thread summing in the opposite shard order.
+    size_t total = 0;
+    for (size_t i = 0; i < kNumMemtableShards; ++i) {
+        std::shared_lock l(pImpl->memtable_shard_locks[i]);
+        total += pImpl->memtable_shards[i].size();
+    }
+    if (total >= pImpl->THRESHOLD) {
         pImpl->flush();
     }
 
@@ -779,15 +833,15 @@ bool StorageEngine::Put(const std::string& key, const std::string& value) {
 }
 
 void StorageEngine::ForceFlush() {
-    std::unique_lock lock(pImpl->memtable_lock);
-    pImpl->flush();
+    pImpl->flush(); // fully self-locking
 }
 
 std::optional<std::string> StorageEngine::Get(const std::string& key) {
     {
-        std::shared_lock lock(pImpl->memtable_lock);
-        auto it = pImpl->memtable.find(key);
-        if (it != pImpl->memtable.end()) {
+        size_t mshard = Impl::memtable_shard_for(key);
+        std::shared_lock lock(pImpl->memtable_shard_locks[mshard]);
+        auto it = pImpl->memtable_shards[mshard].find(key);
+        if (it != pImpl->memtable_shards[mshard].end()) {
             return it->second;
         }
     }
@@ -839,11 +893,18 @@ std::optional<std::string> StorageEngine::Get(const std::string& key) {
 }
 
 bool StorageEngine::Delete(const std::string& key) {
-    std::unique_lock lock(pImpl->memtable_lock);
-
-    if (!pImpl->wal->append(LogOp::DELETE, pImpl->current_seq.load(), key, "")) {
-        return false;
+    // Delete never triggers a flush (unchanged from before this phase):
+    // under eager dead-marking, a delete only shrinks or leaves unchanged
+    // whichever memtable shard it touches, never grows one, so it was
+    // never the thing that could newly cross THRESHOLD.
+    size_t shard = Impl::memtable_shard_for(key);
+    std::unique_lock slock(pImpl->memtable_shard_locks[shard]);
+    bool appended;
+    {
+        std::shared_lock wlock(pImpl->wal_lock);
+        appended = pImpl->wal->append(LogOp::DELETE, pImpl->current_seq.load(), key, "");
     }
+    if (!appended) return false;
 
     pImpl->apply_delete(key);
 
